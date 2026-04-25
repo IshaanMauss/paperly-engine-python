@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 gunicorn
 PyMuPDF
-google-generativeai
+google-genai
 groq
 python-dotenv

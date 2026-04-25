@@ -43,8 +43,13 @@ async def extract_latex_from_image(base64_image: str) -> str:
             )
 
         # 3. Use the dynamically found model name with the STRICT Prompt
+       # Purana logic (jo list kar raha tha) hata do aur yeh use karo:
+        
+        # 3. Use the stable model directly
+        model_name = "gemini-2.0-flash" 
+        
         response = client.models.generate_content(
-            model=vision_model.name,
+            model=model_name,
             contents=[
                 """
                 You are a STRICT and DETERMINISTIC Optical Character Recognition (OCR) engine.
@@ -52,10 +57,9 @@ async def extract_latex_from_image(base64_image: str) -> str:
                 
                 CRITICAL RULES:
                 1. DO NOT summarize, rephrase, or analyze. 
-                2. DO NOT SKIP ANYTHING. Every single word, number, and simple question (e.g., "Find the value of x") MUST be transcribed.
-                3. Look for numbered lists (1, 2, 3...) and bullet points. Transcribe them all sequentially.
-                4. Convert all math symbols, equations, and expressions into exact LaTeX wrapped in $ symbols.
-                5. Return ONLY the raw text. No greetings, no explanations.
+                2. DO NOT SKIP ANYTHING.
+                3. Convert all math symbols, equations, and expressions into exact LaTeX wrapped in $ symbols.
+                4. Return ONLY the raw text. No greetings, no explanations.
                 """,
                 types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
             ]
