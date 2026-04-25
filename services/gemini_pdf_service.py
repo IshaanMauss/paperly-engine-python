@@ -255,7 +255,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
                     contents=[_build_pdf_system_prompt(document_type), uploaded_file],
                     config={"response_mime_type": "application/json"},
                 )
-            except NotFound as fallback_not_found_exc:
+            except Exception as fallback_not_found_exc:
                 raise PipelineServiceError(
                     stage="pdf_native_gemini",
                     message=(
