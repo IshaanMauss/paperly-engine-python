@@ -8,12 +8,21 @@ from services.pipeline_errors import PipelineServiceError
 
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+def _get_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise PipelineServiceError(
+            stage="ocr",
+            message="GEMINI_API_KEY is not configured.",
+            details={"provider": "gemini"},
+        )
+    return genai.Client(api_key=api_key)
 
 async def extract_latex_from_image(base64_image: str) -> str:
     print("🧠 [Production] Auto-detecting and extracting via Gemini...")
     
     try:
+        client = _get_client()
         # Base64 string ko clean karna
         if "," in base64_image:
             base64_image = base64_image.split(",", 1)[1]

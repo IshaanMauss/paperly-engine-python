@@ -1,14 +1,11 @@
-# File: main.py
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load variables immediately
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
 from api.extract_router import router as extract_router
-
-# Load environment variables
-load_dotenv()
 
 app = FastAPI(title="Paperly AI Engine", version="1.0")
 

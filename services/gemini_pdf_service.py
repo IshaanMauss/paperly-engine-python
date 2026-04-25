@@ -4,16 +4,19 @@ import json
 import os
 import tempfile
 import time
+import warnings
 
 import google.generativeai as genai
 from google.api_core.exceptions import NotFound
-from dotenv import load_dotenv
 
 from schemas.ingestion_schema import ExtractedQuestion
 from services.pipeline_errors import PipelineServiceError
 
-load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"google\.generativeai",
+)
 
 
 def _build_pdf_system_prompt(document_type: str) -> str:
@@ -48,6 +51,7 @@ OUTPUT FORMAT (STRICT)
 MARKING SCHEME EXTRACTION RULES (CRITICAL)
 - Extract each row/group from the table where question mapping is possible.
 - Use Question Number as the mapping key in "question" (e.g., "Q1(a)(i)", "Question 5").
+- CRITICAL: You MUST extract the main top-level question number (1, 2, 3, etc.). Do not drop the main integer. If a question is '3 (a) (i)', the question_number MUST be '3(a)(i)'. NEVER extract just the sub-part like '(i)' or '(a)' without its parent number.
 - Put mathematical answer content and marks (e.g., M1, A1, B1, ft, oe) in
   "official_marking_scheme_latex" and mirror the same value in "marking_scheme_latex".
 - Set "question_type" to "SUBJECTIVE" for all marking-scheme rows.
@@ -55,6 +59,10 @@ MARKING SCHEME EXTRACTION RULES (CRITICAL)
 - Preserve hierarchy/new lines with escaped newlines (\\n, \\n\\n) when rows contain subparts.
 
 STRICT LATEX ESCAPING (CRITICAL)
+- You MUST extract ALL mathematical formulas, equations, fractions, variables, and symbols STRICTLY as raw LaTeX code.
+- DO NOT use unicode math characters (like ², ³, ±, α, ∫). Instead, use their exact LaTeX equivalents (e.g., ^2, ^3, \\\\pm, \\\\alpha, \\\\int).
+- Wrap inline math with single dollar signs (e.g., $x^2 + y^2 = 0$) and block math with double dollar signs ($$...$$).
+- The output must be the raw LaTeX string, ready to be saved into a database and parsed by KaTeX later.
 - Double-escape all LaTeX backslashes for JSON validity.
 - Example: write \\\\frac not \\frac.
 
@@ -99,13 +107,20 @@ NESTED IGCSE/IB QUESTION GROUPING (CRITICAL)
 - For SUBJECTIVE questions, DO NOT split sub-parts like (a), (b), (i), (ii) into separate objects.
 - Group each parent numbered question (e.g., 1, 2, 3...) into ONE JSON object.
 - Preserve exact visual hierarchy inside "question" using explicit escaped newlines (\\n and \\n\\n).
+- CRITICAL: You MUST extract the main top-level question number (1, 2, 3, etc.). Do not drop the main integer. If a question is '3 (a) (i)', the question_number MUST be '3(a)(i)'. NEVER extract just the sub-part like '(i)' or '(a)' without its parent number.
 
 MARKING SCHEME TABLES (CRITICAL)
 - If document type is "Marking Scheme", parse marking-scheme table rows and map them into the same schema.
 - Put the scheme/table detail in "marking_scheme_latex" with valid escaped text/LaTeX.
 - Keep each parent numbered question aligned to its corresponding marking scheme content.
+- If the uploaded document is a "Question Paper", you MUST leave "official_marking_scheme_latex" empty ("" or null).
+- NEVER copy question text into "official_marking_scheme_latex" for Question Paper uploads.
 
 STRICT LATEX ESCAPING (CRITICAL)
+- You MUST extract ALL mathematical formulas, equations, fractions, variables, and symbols STRICTLY as raw LaTeX code.
+- DO NOT use unicode math characters (like ², ³, ±, α, ∫). Instead, use their exact LaTeX equivalents (e.g., ^2, ^3, \\\\pm, \\\\alpha, \\\\int).
+- Wrap inline math with single dollar signs (e.g., $x^2 + y^2 = 0$) and block math with double dollar signs ($$...$$).
+- The output must be the raw LaTeX string, ready to be saved into a database and parsed by KaTeX later.
 - Double-escape all LaTeX backslashes for JSON validity.
 - Example: write \\\\frac not \\frac.
 
@@ -256,6 +271,12 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
 
         parsed = _parse_json_payload(getattr(response, "text", "") or "")
         questions = parsed.get("questions_array", [])
+        parsed_json_data = questions
+
+        # Force wipe marking scheme if it's a Question Paper
+        if document_type.lower() == "question paper":
+            for q in parsed_json_data:
+                q["official_marking_scheme_latex"] = ""
 
         normalized_questions = []
         for question in questions:
@@ -264,11 +285,14 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
             payload["question_type"] = payload.get("question_type") or "SUBJECTIVE"
             payload["options"] = payload.get("options") if isinstance(payload.get("options"), list) else []
             payload["question_number"] = payload.get("question_number") or payload.get("question") or ""
-            payload["official_marking_scheme_latex"] = (
-                payload.get("official_marking_scheme_latex")
-                or payload.get("marking_scheme_latex")
-                or ""
-            )
+            if (document_type or "").strip().lower() == "marking scheme":
+                payload["official_marking_scheme_latex"] = (
+                    payload.get("official_marking_scheme_latex")
+                    or payload.get("marking_scheme_latex")
+                    or ""
+                )
+            else:
+                payload["official_marking_scheme_latex"] = ""
             payload["marking_scheme_latex"] = (
                 payload.get("marking_scheme_latex")
                 or payload.get("official_marking_scheme_latex")
@@ -298,6 +322,10 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
 
 
 async def extract_pdf_native_gemini(pdf_base64: str, document_type: str):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set in environment variables.")
+    genai.configure(api_key=api_key)
     return await asyncio.to_thread(_extract_pdf_native_sync, pdf_base64, document_type)
 
 
