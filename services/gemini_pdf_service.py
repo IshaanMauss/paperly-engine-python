@@ -4,19 +4,12 @@ import json
 import os
 import tempfile
 import time
-import warnings
 
-import google.generativeai as genai
+from google import genai
 from google.api_core.exceptions import NotFound
 
 from schemas.ingestion_schema import ExtractedQuestion
 from services.pipeline_errors import PipelineServiceError
-
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    module=r"google\.generativeai",
-)
 
 
 def _build_pdf_system_prompt(document_type: str) -> str:
@@ -144,7 +137,14 @@ def _parse_json_payload(content: str) -> dict:
         raise
 
 
-def _wait_for_file_ready(file_name: str, timeout_seconds: int = 90):
+def _get_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set in environment variables.")
+    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: int = 90):
     deadline = time.time() + timeout_seconds
     last_state = "UNKNOWN"
 
@@ -172,7 +172,7 @@ def _wait_for_file_ready(file_name: str, timeout_seconds: int = 90):
             return str(state_value).upper() or "UNKNOWN"
 
     while time.time() < deadline:
-        remote_file = genai.get_file(file_name)
+        remote_file = client.files.get(name=file_name)
         state = _normalize_state(getattr(remote_file, "state", None))
         last_state = state
 
@@ -186,7 +186,7 @@ def _wait_for_file_ready(file_name: str, timeout_seconds: int = 90):
     raise TimeoutError(f"Uploaded file was not ACTIVE before timeout. Last state: {last_state}")
 
 
-def _pick_available_model() -> str:
+def _pick_available_model(client: genai.Client) -> str:
     preferred = [
         "models/gemini-1.5-pro-latest",
         "models/gemini-2.5-flash",
@@ -195,7 +195,7 @@ def _pick_available_model() -> str:
         "models/gemini-pro-latest",
     ]
     try:
-        available = {m.name for m in genai.list_models()}
+        available = {m.name for m in client.models.list()}
     except Exception:
         # If model listing fails, keep best-effort default.
         return "gemini-1.5-flash-latest"
@@ -222,22 +222,24 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
 
     uploaded_file = None
     temp_file_path = None
+    client = None
 
     try:
+        client = _get_client()
         pdf_bytes = base64.b64decode(normalized)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_file.write(pdf_bytes)
             temp_file_path = temp_file.name
 
-        uploaded_file = genai.upload_file(path=temp_file_path, mime_type="application/pdf")
-        _wait_for_file_ready(uploaded_file.name, timeout_seconds=240)
+        uploaded_file = client.files.upload(file=temp_file_path)
+        _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
         selected_model_name = "gemini-1.5-flash-latest"
         print(f"ℹ️ [Gemini Native PDF] Using model: {selected_model_name}")
-        model = genai.GenerativeModel(selected_model_name)
         try:
-            response = model.generate_content(
-                [_build_pdf_system_prompt(document_type), uploaded_file],
-                generation_config={"response_mime_type": "application/json"},
+            response = client.models.generate_content(
+                model=selected_model_name,
+                contents=[_build_pdf_system_prompt(document_type), uploaded_file],
+                config={"response_mime_type": "application/json"},
             )
         except NotFound as model_not_found_exc:
             print(
@@ -247,12 +249,12 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
             )
             # Optional fallback to a second stable alias.
             try:
-                fallback_model_name = _pick_available_model()
+                fallback_model_name = _pick_available_model(client)
                 print(f"ℹ️ [Gemini Native PDF] Fallback model: {fallback_model_name}")
-                fallback_model = genai.GenerativeModel(fallback_model_name)
-                response = fallback_model.generate_content(
-                    [_build_pdf_system_prompt(document_type), uploaded_file],
-                    generation_config={"response_mime_type": "application/json"},
+                response = client.models.generate_content(
+                    model=fallback_model_name,
+                    contents=[_build_pdf_system_prompt(document_type), uploaded_file],
+                    config={"response_mime_type": "application/json"},
                 )
             except NotFound as fallback_not_found_exc:
                 raise PipelineServiceError(
@@ -309,9 +311,9 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
             details={"provider": "gemini", "reason": str(exc), "exception_type": type(exc).__name__},
         ) from exc
     finally:
-        if uploaded_file is not None:
+        if client is not None and uploaded_file is not None:
             try:
-                genai.delete_file(uploaded_file.name)
+                client.files.delete(name=uploaded_file.name)
             except Exception:
                 pass
         if temp_file_path and os.path.exists(temp_file_path):
@@ -322,10 +324,6 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
 
 
 async def extract_pdf_native_gemini(pdf_base64: str, document_type: str):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set in environment variables.")
-    genai.configure(api_key=api_key)
     return await asyncio.to_thread(_extract_pdf_native_sync, pdf_base64, document_type)
 
 
