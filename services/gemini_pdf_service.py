@@ -6,7 +6,6 @@ import tempfile
 import time
 
 from google import genai
-from google.api_core.exceptions import NotFound
 
 from schemas.ingestion_schema import ExtractedQuestion
 from services.pipeline_errors import PipelineServiceError
@@ -241,7 +240,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str):
                 contents=[_build_pdf_system_prompt(document_type), uploaded_file],
                 config={"response_mime_type": "application/json"},
             )
-        except NotFound as model_not_found_exc:
+        except Exception as model_not_found_exc:
             print(
                 "❌ [Gemini Native PDF Error] Model not found. "
                 "Please ensure your API key has access to Gemini 1.5 and your "
