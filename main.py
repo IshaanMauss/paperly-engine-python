@@ -21,6 +21,7 @@ app.add_middleware(
 app.include_router(extract_router, prefix="/api")
 
 @app.get("/")
+@app.head("/")
 def health_check():
     return {"status": "success", "message": "Python Intelligence Engine is running! 🧠"}
 
