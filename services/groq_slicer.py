@@ -169,7 +169,12 @@ def _extract_chunk(
 
     raise last_error or RuntimeError("Unknown slicer parse failure")
 
-async def slice_and_format_questions(raw_latex: str, document_type: str = "Question Paper") -> List[ExtractedQuestion]:
+def slice_and_format_questions(raw_latex: str, document_type: str = "Question Paper") -> List[ExtractedQuestion]:
+    """
+    Slice and format questions from OCR text.
+    
+    This is a synchronous function that will be called from asyncio.to_thread
+    """
     if not raw_latex or not raw_latex.strip():
         return []
     if not _has_numbered_questions(raw_latex):

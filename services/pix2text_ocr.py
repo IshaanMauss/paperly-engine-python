@@ -17,7 +17,12 @@ def _get_client() -> genai.Client:
         )
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-async def extract_latex_from_image(base64_image: str) -> str:
+def extract_latex_from_image(base64_image: str) -> str:
+    """
+    Extract LaTeX from image using Gemini Vision API.
+    
+    This is a synchronous function that will be called from asyncio.to_thread
+    """
     print("🧠 [Production] Auto-detecting and extracting via Gemini...")
     
     try:

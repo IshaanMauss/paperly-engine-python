@@ -9,10 +9,14 @@ from api.extract_router import router as extract_router
 
 app = FastAPI(title="Paperly AI Engine", version="1.0")
 
-# Security: Allow Node.js to communicate with this Python server
+# Security: Allow Node.js and Frontend to communicate with this Python server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("NODE_BACKEND_ORIGIN", "http://localhost:5000")],
+    allow_origins=[
+        os.getenv("NODE_BACKEND_ORIGIN", "http://localhost:5000"),
+        "http://localhost:5173", # Vite default
+        "http://localhost:3000"  # React default
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
