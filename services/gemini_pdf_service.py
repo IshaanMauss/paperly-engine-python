@@ -566,35 +566,39 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
 
 def _pick_available_model(client) -> str:
     try:
-        # 1. Google se live puchte hain ki is Render server/API key pe kya allowed hai
         available_models = [m.name for m in client.models.list()]
         
-        # Yeh line Render logs mein print karegi ki asli mein kaunse models available hain
-        print(f"🔍 [Render API Check] Allowed Models from Google: {available_models}")
-        
-        # "models/" prefix hata dete hain clean matching ke liye
+        # 'models/' prefix hata do taaki 400 INVALID_ARGUMENT error na aaye
         clean_models = [m.replace("models/", "") for m in available_models]
 
-        # PRIORITY 1: Koi bhi 1.5 Flash (yeh automatically -001, -002, ya -8b pakad lega)
+        print(f"🔍 [Cleaned Models List]: {clean_models}")
+
+        # PRIORITY 1: The New Ultra-Budget Model (Super Cheap, Super Fast)
         for m in clean_models:
-            if "1.5-flash" in m:
-                print(f"✅ Dynamically Selected Model: {m}")
+            if "2.0-flash-lite" in m or "flash-lite-latest" in m:
+                print(f"✅ Dynamically Selected Budget Model: {m}")
                 return m
                 
-        # PRIORITY 2: Agar 1.5 Flash nahi mila, toh koi bhi 'flash' model utha lo
+        # PRIORITY 2: The Standard 2.0 Flash (Strong IQ, Still Cheap)
+        for m in clean_models:
+            if "2.0-flash" in m or "flash-latest" in m:
+                print(f"✅ Dynamically Selected Standard Model: {m}")
+                return m
+
+        # PRIORITY 3: Just grab any flash model to save money
         for m in clean_models:
             if "flash" in m:
                 return m
 
-        # PRIORITY 3: Agar kuch bhi match nahi hua, toh jo list mein pehla hai wahi de do
+        # PRIORITY 4: Grab whatever is first if everything fails
         if clean_models:
             return clean_models[0]
             
     except Exception as e:
         print(f"❌ API Listing Error: {e}")
         
-    # ULTIMATE FALLBACK: Exact hard-versioned model (Alias bugs ko bypass karne ke liye)
-    return "gemini-1.5-flash-002"
+    # ULTIMATE FALLBACK: Safe default from your actual log
+    return "gemini-2.0-flash"
 
 
 # ---------------------------------------------------------------------------
