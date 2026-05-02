@@ -565,17 +565,45 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
 def _pick_available_model(client: genai.Client) -> str:
+    # SMART TIERING: [High IQ + Low Cost] -> [Ultra-Cheap] -> [Expensive Heavyweights]
     preferred = [
-        "models/gemini-1.5-pro-latest", "models/gemini-2.5-flash", 
-        "models/gemini-2.0-flash", "models/gemini-flash-latest", "models/gemini-pro-latest",
+        # TIER 1: The "Sweet Spot" (Top Priority)
+        # Highly capable for complex LaTeX and strict JSON, but very cost-effective.
+        "models/gemini-1.5-flash-latest",
+        "models/gemini-2.0-flash", 
+        
+        # TIER 2: The Ultra-Budget Fallback
+        # Extremely cheap and fast. Great if Tier 1 models are rate-limited.
+        "models/gemini-1.5-flash-8b",
+        
+        # TIER 3: The "Break Glass in Emergency" Models
+        # High cost, High IQ. Placed at the very bottom so they are ONLY used if everything else fails.
+        "models/gemini-1.5-pro-latest", 
+        "models/gemini-2.5-flash",
     ]
-    try: available = {m.name for m in client.models.list()}
-    except Exception: return "gemini-1.5-flash-latest"
+    
+    # Safely fetch available models, fallback to our best workhorse if API fails
+    try: 
+        available = {m.name for m in client.models.list()}
+    except Exception: 
+        return "gemini-1.5-flash-latest"
 
+    # 1. Strict Priority Match: Go through our meticulously planned list
     for model_name in preferred:
-        if model_name in available: return model_name.replace("models/", "")
+        if model_name in available: 
+            return model_name.replace("models/", "")
+            
+    # 2. Smart Fallback: If preferred list completely fails (rare), 
+    # aggressively hunt for ANY "flash" model before touching a "pro" model to save money.
     for model_name in available:
-        if model_name.startswith("models/gemini-"): return model_name.replace("models/", "")
+        if "flash" in model_name.lower(): 
+            return model_name.replace("models/", "")
+            
+    # 3. Absolute Last Resort: Grab whatever gemini model is left
+    for model_name in available:
+        if model_name.startswith("models/gemini-"): 
+            return model_name.replace("models/", "")
+            
     return "gemini-1.5-flash-latest"
 
 
