@@ -566,39 +566,37 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
 
 def _pick_available_model(client) -> str:
     try:
+        # Seedha API se original list uthao (in sabme 'models/' pehle se laga hoga)
         available_models = [m.name for m in client.models.list()]
         
-        # 'models/' prefix hata do taaki 400 INVALID_ARGUMENT error na aaye
-        clean_models = [m.replace("models/", "") for m in available_models]
-
-        print(f"🔍 [Cleaned Models List]: {clean_models}")
+        print(f"🔍 [Render API Check] Original Models List: {available_models}")
 
         # PRIORITY 1: The New Ultra-Budget Model (Super Cheap, Super Fast)
-        for m in clean_models:
+        for m in available_models:
             if "2.0-flash-lite" in m or "flash-lite-latest" in m:
                 print(f"✅ Dynamically Selected Budget Model: {m}")
                 return m
                 
         # PRIORITY 2: The Standard 2.0 Flash (Strong IQ, Still Cheap)
-        for m in clean_models:
+        for m in available_models:
             if "2.0-flash" in m or "flash-latest" in m:
                 print(f"✅ Dynamically Selected Standard Model: {m}")
                 return m
 
         # PRIORITY 3: Just grab any flash model to save money
-        for m in clean_models:
+        for m in available_models:
             if "flash" in m:
                 return m
 
         # PRIORITY 4: Grab whatever is first if everything fails
-        if clean_models:
-            return clean_models[0]
+        if available_models:
+            return available_models[0]
             
     except Exception as e:
         print(f"❌ API Listing Error: {e}")
         
-    # ULTIMATE FALLBACK: Safe default from your actual log
-    return "gemini-2.0-flash"
+    # ULTIMATE FALLBACK: Exact hard-versioned model (WITH "models/" prefix!)
+    return "models/gemini-2.0-flash"
 
 
 # ---------------------------------------------------------------------------
