@@ -660,7 +660,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
 
-        primary_model = "_pick_available_model(client)"
+        primary_model = _pick_available_model(client)
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
         try:
