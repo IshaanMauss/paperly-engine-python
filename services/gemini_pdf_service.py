@@ -564,39 +564,34 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
         time.sleep(1.5)
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
-def _pick_available_model(client) -> str:
+def _pick_available_model(client, exclude: str = "") -> str:
+    UNSUPPORTED_JSON_MODE = ["flash-lite", "flash-image", "tts", "audio",
+                              "embedding", "imagen", "veo", "gemma", "aqa",
+                              "robotics", "lyria", "nano", "research", "live"]
     try:
-        # Seedha API se original list uthao (in sabme 'models/' pehle se laga hoga)
         available_models = [m.name for m in client.models.list()]
-        
-        print(f"🔍 [Render API Check] Original Models List: {available_models}")
 
-        # PRIORITY 1: The New Ultra-Budget Model (Super Cheap, Super Fast)
-        for m in available_models:
-            if "2.0-flash-lite" in m or "flash-lite-latest" in m:
-                print(f"✅ Dynamically Selected Budget Model: {m}")
-                return m
-                
-        # PRIORITY 2: The Standard 2.0 Flash (Strong IQ, Still Cheap)
-        for m in available_models:
-            if "2.0-flash" in m or "flash-latest" in m:
-                print(f"✅ Dynamically Selected Standard Model: {m}")
-                return m
+        json_capable = [
+            m for m in available_models
+            if not any(skip in m.lower() for skip in UNSUPPORTED_JSON_MODE)
+            and m.replace("models/", "") != exclude  # ← skip the failed one
+        ]
 
-        # PRIORITY 3: Just grab any flash model to save money
-        for m in available_models:
-            if "flash" in m:
-                return m
+        for m in json_capable:
+            if "2.0-flash" in m and "lite" not in m:
+                return m.replace("models/", "")
 
-        # PRIORITY 4: Grab whatever is first if everything fails
-        if available_models:
-            return available_models[0]
-            
+        for m in json_capable:
+            if "flash" in m and "lite" not in m:
+                return m.replace("models/", "")
+
+        if json_capable:
+            return json_capable[0].replace("models/", "")
+
     except Exception as e:
         print(f"❌ API Listing Error: {e}")
-        
-    # ULTIMATE FALLBACK: Exact hard-versioned model (WITH "models/" prefix!)
-    return "models/gemini-2.0-flash"
+
+    return "gemini-2.0-flash"
 
 
 # ---------------------------------------------------------------------------
@@ -669,8 +664,9 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                 config={"response_mime_type": "application/json"},
             )
         except Exception as primary_exc:
-            print(f"⚠️  [Gemini Native PDF] Primary model failed ({primary_exc}). Trying fallback…")
-            fallback_model = _pick_available_model(client)
+            print(f"⚠️  [Gemini Native PDF] Primary model {primary_model!r} failed ({primary_exc}). Trying fallback…")
+            fallback_model = _pick_available_model(client, exclude=primary_model)  # ← exclude failed
+            print(f"⚠️  [Gemini Native PDF] Fallback model: {fallback_model!r}")
             try:
                 response = client.models.generate_content(
                     model=fallback_model, contents=[system_prompt, uploaded_file],
@@ -681,13 +677,10 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                     stage="pdf_native_gemini", message="All models failed.",
                     details={"provider": "gemini", "reason": str(fallback_exc), "exception_type": type(fallback_exc).__name__},
                 ) from fallback_exc
-                
-            raw_text = getattr(response, "text", "") or ""
+
+        raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
         
-        if needs_review:
-            for question in parsed_dict.get("questions_array", []):
-                if isinstance(question, dict): question["needs_review"] = True
         
         # ---------------------------------------------------------------------------
         # CRITICAL FIX: Diagram Crop Logic runs on parsed_dict BEFORE Pydantic models
