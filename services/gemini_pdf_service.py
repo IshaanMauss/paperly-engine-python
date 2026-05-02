@@ -564,49 +564,19 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
         time.sleep(1.5)
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
-def _pick_available_model(client, exclude: str = "") -> str:
-    UNSUPPORTED_JSON_MODE = ["flash-image", "tts", "audio",
-                              "embedding", "imagen", "veo", "gemma", "aqa",
-                              "robotics", "lyria", "nano", "research", "live"]
+def _pick_available_model(client: genai.Client) -> str:
+    preferred = [
+        "models/gemini-1.5-pro-latest", "models/gemini-2.5-flash", 
+        "models/gemini-2.0-flash", "models/gemini-flash-latest", "models/gemini-pro-latest",
+    ]
+    try: available = {m.name for m in client.models.list()}
+    except Exception: return "gemini-1.5-flash-latest"
 
-    # Explicitly dead models — listed but return 404
-    DEPRECATED = ["gemini-2.0-flash-001", "gemini-2.0-flash-lite-001",
-                  "gemini-2.0-flash-lite", "gemini-2.0-flash"]
-
-    try:
-        available_models = [m.name for m in client.models.list()]
-
-        json_capable = [
-            m for m in available_models
-            if not any(skip in m.lower() for skip in UNSUPPORTED_JSON_MODE)
-            and m.replace("models/", "") not in DEPRECATED
-            and m.replace("models/", "") != exclude
-        ]
-
-        # PRIORITY 1: 2.5-flash — cheap, fast, supports JSON mode
-        for m in json_capable:
-            if "2.5-flash" in m and "lite" not in m and "tts" not in m and "audio" not in m:
-                selected = m.replace("models/", "")
-                print(f"✅ Selected model: {selected}")
-                return selected
-
-        # PRIORITY 2: Any flash that survived the filter
-        for m in json_capable:
-            if "flash" in m:
-                selected = m.replace("models/", "")
-                print(f"✅ Selected fallback: {selected}")
-                return selected
-
-        # PRIORITY 3: Anything left
-        if json_capable:
-            selected = json_capable[0].replace("models/", "")
-            print(f"✅ Last resort: {selected}")
-            return selected
-
-    except Exception as e:
-        print(f"❌ API Listing Error: {e}")
-
-    return "gemini-2.5-flash"  # hard fallback
+    for model_name in preferred:
+        if model_name in available: return model_name.replace("models/", "")
+    for model_name in available:
+        if model_name.startswith("models/gemini-"): return model_name.replace("models/", "")
+    return "gemini-1.5-flash-latest"
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +640,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
 
-        primary_model = _pick_available_model(client)
+        primary_model = "gemini-1.5-flash-latest"
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
         try:
@@ -679,9 +649,8 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                 config={"response_mime_type": "application/json"},
             )
         except Exception as primary_exc:
-            print(f"⚠️  [Gemini Native PDF] Primary model {primary_model!r} failed ({primary_exc}). Trying fallback…")
-            fallback_model = _pick_available_model(client, exclude=primary_model)  # ← exclude failed
-            print(f"⚠️  [Gemini Native PDF] Fallback model: {fallback_model!r}")
+            print(f"⚠️  [Gemini Native PDF] Primary model failed ({primary_exc}). Trying fallback…")
+            fallback_model = _pick_available_model(client)
             try:
                 response = client.models.generate_content(
                     model=fallback_model, contents=[system_prompt, uploaded_file],
@@ -692,16 +661,16 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                     stage="pdf_native_gemini", message="All models failed.",
                     details={"provider": "gemini", "reason": str(fallback_exc), "exception_type": type(fallback_exc).__name__},
                 ) from fallback_exc
-
-        raw_text = getattr(response, "text", "") or ""
+                
+            raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
         
+        if needs_review:
+            for question in parsed_dict.get("questions_array", []):
+                if isinstance(question, dict): question["needs_review"] = True
         
         # ---------------------------------------------------------------------------
         # CRITICAL FIX: Diagram Crop Logic runs on parsed_dict BEFORE Pydantic models
-        # ---------------------------------------------------------------------------
-        # ---------------------------------------------------------------------------
-        # CRITICAL FIX: Diagram Smart Crop Engine (Page Specific + Y-Range Slice)
         # ---------------------------------------------------------------------------
         try:
             questions_list = parsed_dict.get("questions_array", [])
@@ -710,7 +679,10 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
             for q in questions_list:
                 if isinstance(q, dict):
                     urls = q.get("diagram_urls", [])
-                    if (isinstance(urls, list) and "[NEEDS_CROP]" in urls) or urls == "[NEEDS_CROP]":
+                    if isinstance(urls, list) and "[NEEDS_CROP]" in urls:
+                        needs_crop = True
+                        break
+                    elif urls == "[NEEDS_CROP]":
                         needs_crop = True
                         break
 
@@ -722,40 +694,18 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                         if isinstance(q, dict):
                             urls = q.get("diagram_urls", [])
                             if (isinstance(urls, list) and "[NEEDS_CROP]" in urls) or urls == "[NEEDS_CROP]":
-                                
-                                # 1. Extract Page Number (Fallback to page 1 if LLM misses)
-                                page_num = int(q.get("diagram_page_number", 1)) - 1
-                                page_num = max(0, min(page_num, len(doc) - 1)) # Clamp to valid range
-                                page = doc[page_num]
-                                
-                                # 2. Extract Y-Range for specific slicing
-                                rect = page.rect
-                                crop_rect = rect # Default to full page
-                                
-                                y_range = q.get("diagram_y_range", [])
-                                if isinstance(y_range, list) and len(y_range) == 2:
-                                    try:
-                                        top_y = float(y_range[0])
-                                        bot_y = float(y_range[1])
-                                        if bot_y > top_y:
-                                            # Convert percentage to actual pixels with 20px padding
-                                            y0 = max(0, int(rect.height * top_y) - 20)
-                                            y1 = min(rect.height, int(rect.height * bot_y) + 20)
-                                            crop_rect = fitz.Rect(0, y0, rect.width, y1)
-                                    except Exception:
-                                        pass # If math fails, fallback to full page screenshot
-
-                                # 3. Rasterize ONLY that specific slice
-                                pix = page.get_pixmap(clip=crop_rect, colorspace=fitz.csRGB, alpha=False)
+                                page = doc[0]
+                                rect = page.rect 
+                                pix = page.get_pixmap(clip=rect, colorspace=fitz.csRGB, alpha=False)
                                 image_bytes = pix.tobytes("png")
                                 image_b64 = base64.b64encode(image_bytes).decode('utf-8')
                                 fallback_img = f"data:image/png;base64,{image_b64}"
+                                # Plain python dict mutation is 100% safe
                                 q["diagram_urls"] = [fallback_img]
                 finally:
                     doc.close()
         except Exception as e:
             print(f"⚠️  [Gemini Native PDF] Failed to generate Base64 diagram crop buffer: {e}")
-        # ---------------------------------------------------------------------------
         # ---------------------------------------------------------------------------
         
         normalized_response = _normalize_response(
