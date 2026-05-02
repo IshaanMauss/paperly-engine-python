@@ -564,34 +564,37 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
         time.sleep(1.5)
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
-def _pick_available_model(client: genai.Client) -> str:
-    # SMART TIERING: Removed '-latest' suffixes to match Google's updated API
-    preferred = [
-        "models/gemini-1.5-flash",       # Standard Flash (Top Priority)
-        "models/gemini-2.0-flash", 
-        "models/gemini-1.5-flash-8b",    # Ultra Budget
-        "models/gemini-1.5-pro",         # Standard Pro
-        "models/gemini-2.5-flash",
-    ]
-    
-    try: 
-        available = {m.name for m in client.models.list()}
-    except Exception: 
-        return "gemini-1.5-flash" # Fallback mein se bhi -latest hata diya
+def _pick_available_model(client) -> str:
+    try:
+        # 1. Google se live puchte hain ki is Render server/API key pe kya allowed hai
+        available_models = [m.name for m in client.models.list()]
+        
+        # Yeh line Render logs mein print karegi ki asli mein kaunse models available hain
+        print(f"🔍 [Render API Check] Allowed Models from Google: {available_models}")
+        
+        # "models/" prefix hata dete hain clean matching ke liye
+        clean_models = [m.replace("models/", "") for m in available_models]
 
-    for model_name in preferred:
-        if model_name in available: 
-            return model_name.replace("models/", "")
+        # PRIORITY 1: Koi bhi 1.5 Flash (yeh automatically -001, -002, ya -8b pakad lega)
+        for m in clean_models:
+            if "1.5-flash" in m:
+                print(f"✅ Dynamically Selected Model: {m}")
+                return m
+                
+        # PRIORITY 2: Agar 1.5 Flash nahi mila, toh koi bhi 'flash' model utha lo
+        for m in clean_models:
+            if "flash" in m:
+                return m
+
+        # PRIORITY 3: Agar kuch bhi match nahi hua, toh jo list mein pehla hai wahi de do
+        if clean_models:
+            return clean_models[0]
             
-    for model_name in available:
-        if "flash" in model_name.lower(): 
-            return model_name.replace("models/", "")
-            
-    for model_name in available:
-        if model_name.startswith("models/gemini-"): 
-            return model_name.replace("models/", "")
-            
-    return "gemini-1.5-flash"
+    except Exception as e:
+        print(f"❌ API Listing Error: {e}")
+        
+    # ULTIMATE FALLBACK: Exact hard-versioned model (Alias bugs ko bypass karne ke liye)
+    return "gemini-1.5-flash-002"
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +658,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
 
-        primary_model = "gemini-1.5-flash"
+        primary_model = "_pick_available_model(client)"
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
         try:
