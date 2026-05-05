@@ -29,7 +29,7 @@ def _generate_igcse_paper_reference_key(filename: str) -> str:
       0580_m22_ms_12   ->  igcse_0580_m22_ms_12
 
     Season codes: s = May/June, w = Oct/Nov, m = Feb/March
-    Falls back to empty string if the filename doesn"t match.
+    Falls back to empty string if the filename doesn't match.
     """
     if not filename:
         return ""
@@ -56,14 +56,14 @@ def _generate_igcse_paper_reference_key(filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _generate_ib_paper_reference_key(subject: str, level: str, paper_number: str,
-                                   timezone: str, session: str, year: str,
-                                   document_type: str) -> str:
-    subject      = str(subject      or "").strip()
-    level        = str(level        or "").strip()
-    paper_number = str(paper_number or "").strip()
-    timezone     = str(timezone     or "").strip()
-    session      = str(session      or "").strip()
-    year         = str(year         or "").strip()
+                                     timezone: str, session: str, year: str,
+                                     document_type: str) -> str:
+    subject       = str(subject       or "").strip()
+    level         = str(level         or "").strip()
+    paper_number  = str(paper_number  or "").strip()
+    timezone      = str(timezone      or "").strip()
+    session       = str(session       or "").strip()
+    year          = str(year          or "").strip()
     document_type = str(document_type or "").strip()
 
     if not all([subject, paper_number, session, year, document_type]):
@@ -85,16 +85,16 @@ def _generate_ib_paper_reference_key(subject: str, level: str, paper_number: str
     session_code = session.lower().replace("/", "").replace(" ", "")
     year_code    = year
     doc_code     = "qp" if document_type.lower() == "question paper" else "ms"
-    
+
     parts = ["ib", subject_code, level_code, paper_code]
-    
     if tz_code:
         parts.append(tz_code)
-    
     parts.append(f"{session_code}{year_code}")
     parts.append(doc_code)
-    
+
     return "_".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # IGCSE Page Verification using Regex
 # ---------------------------------------------------------------------------
@@ -108,66 +108,65 @@ def _verify_igcse_metadata_from_text(text: str, paper_reference_key: str) -> dic
         "mismatches": [],
         "extracted": {}
     }
-    
+
     if not text or not paper_reference_key:
         result["match_status"] = False
         result["mismatches"].append("no_text_or_key")
         return result
-    
+
     if not paper_reference_key.startswith("igcse_"):
         return result
-    
+
     text = " ".join(text.split())
     key_parts = paper_reference_key.split('_')
     if len(key_parts) < 3:
         result["match_status"] = False
         result["mismatches"].append("invalid_key_format")
         return result
-    
+
     expected_subject = key_parts[1]
-    
+
     season_year_match = re.search(r"[smw](\d{2})", paper_reference_key)
     expected_year = f"20{season_year_match.group(1)}" if season_year_match else None
-    
+
     season_match = re.search(r"_([smw])\d{2}_", paper_reference_key)
     expected_session_code = season_match.group(1) if season_match else None
-    
+
     session_map = {
         "s": ["may", "june", "summer", "may/june", "june/july"],
         "w": ["october", "november", "winter", "oct", "nov", "oct/nov", "october/november"],
         "m": ["february", "march", "feb", "mar", "feb/mar", "february/march", "march/april", "mar/apr"]
     }
     expected_session_names = session_map.get(expected_session_code, []) if expected_session_code else []
-    
+
     subject_match = re.search(r"mathematics\s*\(?(\d{4})\)?", text, re.IGNORECASE)
     if subject_match:
         result["extracted"]["subject_code"] = subject_match.group(1)
-    
+
     year_match = re.search(r"(20\d{2})", text)
     if year_match:
         result["extracted"]["year"] = year_match.group(1)
-    
+
     session_pattern = r"(may|june|october|november|february|march|winter|summer)"
-    session_match = re.search(session_pattern, text, re.IGNORECASE)
-    if session_match:
-        result["extracted"]["session"] = session_match.group(1).lower()
-    
+    session_match_text = re.search(session_pattern, text, re.IGNORECASE)
+    if session_match_text:
+        result["extracted"]["session"] = session_match_text.group(1).lower()
+
     if "subject_code" in result["extracted"]:
         if result["extracted"]["subject_code"] != expected_subject:
             result["match_status"] = False
             result["mismatches"].append("subject_code")
-    
+
     if "year" in result["extracted"] and expected_year:
         if result["extracted"]["year"] != expected_year:
             result["match_status"] = False
             result["mismatches"].append("year")
-    
+
     if "session" in result["extracted"] and expected_session_names:
         if result["extracted"]["session"] not in expected_session_names:
             result["match_status"] = False
-            # BUG FIXED: Removed the double closing bracket ']]'
             result["mismatches"].append("session")
-    
+
     return result
 
 
@@ -179,15 +178,15 @@ def _extract_ib_metadata_from_page(page_base64: str) -> dict:
     try:
         client = _get_client()
         model = _pick_available_model(client)
-        
+
         pdf_bytes = base64.b64decode(page_base64.split(",", 1)[1] if "," in page_base64 else page_base64)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(pdf_bytes)
             temp_file_path = tmp.name
-        
+
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
-        
+
         system_prompt = """
 You are an IB mathematics document classifier with high precision.
 Analyze ONLY the first page of this IB document and extract the following metadata STRICTLY and NOTHING ELSE:
@@ -215,7 +214,7 @@ CRITICAL RULES:
             )
             raw_text = getattr(response, "text", "") or ""
             parsed = _parse_json_payload(raw_text)
-            
+
             client.files.delete(name=uploaded_file.name)
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
@@ -226,7 +225,8 @@ CRITICAL RULES:
     except Exception as e:
         print(f"❌ [IB Metadata Extraction Error] {type(e).__name__}: {e!r}")
         return None
-    
+
+
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
@@ -344,6 +344,7 @@ _METADATA_DEFAULTS: dict = {
     "year": 0, "paper_reference_key": "", "ref_code_base": "", "ref_code_full": "",
 }
 
+
 def _normalize_tier(tier: str | None) -> str:
     if not tier or not isinstance(tier, str):
         return "N/A"
@@ -354,18 +355,23 @@ def _normalize_tier(tier: str | None) -> str:
     if "extended" in tier_lower: return "Extended"
     return "N/A"
 
+
 def _remap_keys(raw: dict, alias_map: dict[str, str]) -> dict:
     out = {}
     for k, v in raw.items():
         canonical = alias_map.get(k, k)
-        if canonical not in out: out[canonical] = v
-        else: out[k] = v 
+        if canonical not in out:
+            out[canonical] = v
+        else:
+            out[k] = v
     return out
+
 
 def _coerce_int(value, default: int = 0) -> int:
     if value is None: return default
     try: return int(value)
     except (ValueError, TypeError): return default
+
 
 def _coerce_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool): return value
@@ -373,11 +379,13 @@ def _coerce_bool(value, default: bool = False) -> bool:
     if isinstance(value, int): return bool(value)
     return default
 
+
 def _coerce_list(value, default=None) -> list:
     if default is None: default = []
     if isinstance(value, list): return value
     if value is None: return default
     return [str(value)]
+
 
 def _normalize_method_steps(raw_steps) -> list:
     if not isinstance(raw_steps, list): return []
@@ -391,15 +399,21 @@ def _normalize_method_steps(raw_steps) -> list:
         elif isinstance(step, str):
             result.append({"type": "note", "description": step.strip()})
     return result
+
+
 def _normalize_metadata(raw: dict | None, filename: str, board: str, generated_key_override: str = "") -> dict:
     if not isinstance(raw, dict): raw = {}
-        
+
     extracted_curr = str(raw.get("curriculum", "")).upper()
-    if "INTERNATIONAL BACCALAUREATE" in extracted_curr or "IB" in extracted_curr: raw["curriculum"] = "IB"
-    elif "CAMBRIDGE" in extracted_curr or "IGCSE" in extracted_curr: raw["curriculum"] = "IGCSE"
-        
-    if board and ("INTERNATIONAL BACCALAUREATE" in board.upper() or board.upper() == "IB"): board = "IB"
-    elif board and ("CAMBRIDGE" in board.upper() or board.upper() == "IGCSE"): board = "IGCSE"
+    if "INTERNATIONAL BACCALAUREATE" in extracted_curr or "IB" in extracted_curr:
+        raw["curriculum"] = "IB"
+    elif "CAMBRIDGE" in extracted_curr or "IGCSE" in extracted_curr:
+        raw["curriculum"] = "IGCSE"
+
+    if board and ("INTERNATIONAL BACCALAUREATE" in board.upper() or board.upper() == "IB"):
+        board = "IB"
+    elif board and ("CAMBRIDGE" in board.upper() or board.upper() == "IGCSE"):
+        board = "IGCSE"
 
     raw = _remap_keys(raw, _METADATA_FIELD_ALIASES)
     result = dict(_METADATA_DEFAULTS)
@@ -407,15 +421,15 @@ def _normalize_metadata(raw: dict | None, filename: str, board: str, generated_k
     result["paperNumber"] = _coerce_int(result["paperNumber"], 0)
     result["year"] = _coerce_int(result["year"], 0)
     result["tier"] = _normalize_tier(result.get("tier"))
-    
+
     generated_key = ""
     if board.upper() == "IGCSE":
         generated_key = _generate_igcse_paper_reference_key(filename)
-    else: 
+    else:
         generated_key = generated_key_override or result.get("paper_reference_key", "")
-    
+
     result["paper_reference_key"] = generated_key or result.get("paper_reference_key", "")
-    result["curriculum"] = board.upper() 
+    result["curriculum"] = board.upper()
     return result
 
 
@@ -435,7 +449,8 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
         if not result.get(meta_key) and fallback_metadata.get(meta_key):
             result[meta_key] = fallback_metadata[meta_key]
 
-    if fallback_metadata.get("curriculum"): result["curriculum"] = fallback_metadata["curriculum"]
+    if fallback_metadata.get("curriculum"):
+        result["curriculum"] = fallback_metadata["curriculum"]
     if not result.get("paper_reference_key") and fallback_metadata.get("paper_reference_key"):
         result["paper_reference_key"] = fallback_metadata["paper_reference_key"]
 
@@ -449,24 +464,26 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
     result["year"] = _coerce_int(result["year"], 0)
     result["isTemplatizable"] = _coerce_bool(result["isTemplatizable"], False)
     result["variables"] = _coerce_list(result["variables"], [])
-    
+
     raw_diagrams = _coerce_list(result["diagram_urls"], [])
     valid_urls = []
     has_diagram_indicator = False
-    
+
     flattened_diagrams = []
     for item in raw_diagrams:
         if item is None: continue
-        if isinstance(item, list): flattened_diagrams.extend([str(subitem).strip() for subitem in item if subitem])
-        else: flattened_diagrams.append(str(item).strip())
-    
+        if isinstance(item, list):
+            flattened_diagrams.extend([str(subitem).strip() for subitem in item if subitem])
+        else:
+            flattened_diagrams.append(str(item).strip())
+
     for item_str in flattened_diagrams:
         if not item_str: continue
         if item_str.startswith("http") or item_str.startswith("data:image") or item_str == "[NEEDS_CROP]":
             valid_urls.append(item_str)
         elif item_str != "[]" and item_str not in ["null", "undefined"]:
             has_diagram_indicator = True
-    
+
     result["diagram_urls"] = valid_urls
     result["needs_review"] = _coerce_bool(result["needs_review"], False)
 
@@ -474,7 +491,7 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
         q_latex = (result.get("question_latex") or "").lower()
         if has_diagram_indicator or "diagram" in q_latex or "graph" in q_latex or "figure" in q_latex:
             result["diagram_urls"] = []
-    
+
     if not isinstance(result["diagram_urls"], list): result["diagram_urls"] = []
     result["curriculum"] = result["curriculum"] or ""
     result["subjectCode"] = result["subjectCode"] or ""
@@ -483,9 +500,17 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
     return result
 
 
-def _normalize_response(parsed: dict, filename: str, document_type: str, board: str, generated_paper_reference_key: str = "", extra_metadata: dict = None) -> SlicedQuestionsResponse:
+def _normalize_response(
+    parsed: dict,
+    filename: str,
+    document_type: str,
+    board: str,
+    generated_paper_reference_key: str = "",
+    extra_metadata: dict = None,
+) -> SlicedQuestionsResponse:
     meta_raw = parsed.get("metadata") or {}
-    if extra_metadata: meta_raw.update(extra_metadata)
+    if extra_metadata:
+        meta_raw.update(extra_metadata)
     meta_normalized = _normalize_metadata(meta_raw, filename, board, generated_paper_reference_key)
 
     questions_raw = parsed.get("questions_array") or []
@@ -509,7 +534,8 @@ def _normalize_response(parsed: dict, filename: str, document_type: str, board: 
                 schema_fields = set(ExtractedQuestion.model_fields.keys())
                 filtered_safe = {k: v for k, v in safe.items() if k in schema_fields}
                 questions.append(ExtractedQuestion(**filtered_safe))
-            except Exception: pass
+            except Exception:
+                pass
 
     return SlicedQuestionsResponse(
         metadata=ExtractedPaperMetadata(**meta_normalized),
@@ -518,7 +544,8 @@ def _normalize_response(parsed: dict, filename: str, document_type: str, board: 
 
 
 def _parse_json_payload(content: str) -> dict:
-    if not content or not content.strip(): return {"metadata": {}, "questions_array": []}
+    if not content or not content.strip():
+        return {"metadata": {}, "questions_array": []}
     try:
         cleaned_content = re.sub(r'^```json\s*', '', content, flags=re.MULTILINE)
         cleaned_content = re.sub(r'^```\s*', '', cleaned_content, flags=re.MULTILINE)
@@ -527,21 +554,26 @@ def _parse_json_payload(content: str) -> dict:
         start = content.find("{")
         end = content.rfind("}")
         if start != -1 and end != -1 and end > start:
-            json_str = content[start : end + 1]
+            json_str = content[start: end + 1]
             json_str = re.sub(r'[\x00-\x1F]+', ' ', json_str)
-            try: return json.loads(json_str)
+            try:
+                return json.loads(json_str)
             except json.JSONDecodeError as final_err:
                 print(f"CRITICAL PARSE FAIL: {final_err}")
                 return {"metadata": {}, "questions_array": []}
         return {"metadata": {}, "questions_array": []}
-    # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Gemini client helpers
 # ---------------------------------------------------------------------------
 
 def _get_client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key: raise ValueError("GEMINI_API_KEY is not set in environment variables.")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set in environment variables.")
     return genai.Client(api_key=api_key)
+
 
 def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: int = 240):
     deadline = time.time() + timeout_seconds
@@ -564,26 +596,76 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
         time.sleep(1.5)
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
+
 def _pick_available_model(client: genai.Client) -> str:
+    # FIX: Updated preferred list with current, valid Gemini model IDs
     preferred = [
-        "models/gemini-1.5-pro-latest", "models/gemini-2.5-flash", 
-        "models/gemini-2.0-flash", "models/gemini-flash-latest", "models/gemini-pro-latest",
+        "models/gemini-2.5-flash-preview-05-20",
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-2.0-flash-lite",
+        "models/gemini-1.5-pro",
+        "models/gemini-1.5-flash",
     ]
-    try: available = {m.name for m in client.models.list()}
-    except Exception: return "gemini-1.5-flash-latest"
+    try:
+        available = {m.name for m in client.models.list()}
+    except Exception:
+        return "gemini-2.0-flash"
 
     for model_name in preferred:
-        if model_name in available: return model_name.replace("models/", "")
+        if model_name in available:
+            return model_name.replace("models/", "")
     for model_name in available:
-        if model_name.startswith("models/gemini-"): return model_name.replace("models/", "")
-    return "gemini-1.5-flash-latest"
+        if model_name.startswith("models/gemini-"):
+            return model_name.replace("models/", "")
+    return "gemini-2.0-flash"
+
+
+# ---------------------------------------------------------------------------
+# FIX: Retry helper for transient 503 / rate-limit errors
+# ---------------------------------------------------------------------------
+
+def _generate_with_retry(
+    client: genai.Client,
+    model: str,
+    contents: list,
+    config: dict,
+    retries: int = 3,
+    delay: float = 5.0,
+):
+    """Wraps generate_content with simple retry logic for transient server errors."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)
+            is_transient = "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            if is_transient and attempt < retries - 1:
+                wait = delay * (attempt + 1)
+                print(f"⚠️  [Gemini] Transient error on attempt {attempt + 1}/{retries}, retrying in {wait:.0f}s… ({e})")
+                time.sleep(wait)
+                continue
+            raise
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
 # Core extraction (sync, runs in a thread)
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str, board: str = "IGCSE", page1_base64: str = None) -> SlicedQuestionsResponse:
+def _extract_pdf_native_sync(
+    pdf_base64: str,
+    document_type: str,
+    filename: str,
+    board: str = "IGCSE",
+    page1_base64: str = None,
+) -> SlicedQuestionsResponse:
     if not pdf_base64 or not pdf_base64.strip():
         empty_meta = ExtractedPaperMetadata(**_METADATA_DEFAULTS)
         return SlicedQuestionsResponse(metadata=empty_meta, questions_array=[])
@@ -595,6 +677,7 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
     uploaded_file = None
     temp_file_path = None
     client = None
+    extra_metadata = {}
     validation_result = {"match_status": True, "mismatches": []}
     paper_reference_key = ""
 
@@ -608,11 +691,10 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
         if board.upper() == "IGCSE":
             paper_reference_key = _generate_igcse_paper_reference_key(filename)
             print(f"ℹ️  [Gemini Native PDF] IGCSE paper_reference_key: {paper_reference_key!r}")
-            if page1_base64: validation_result = {"match_status": True, "mismatches": []}
         else:
-            extra_metadata = {}
             ib_metadata = {}
-            if page1_base64: ib_metadata = _extract_ib_metadata_from_page(page1_base64) or {}
+            if page1_base64:
+                ib_metadata = _extract_ib_metadata_from_page(page1_base64) or {}
             ref_code, method = regex_extract_ref_code(temp_file_path)
             ref_code_base = ref_code.base if ref_code else ""
             if ref_code:
@@ -626,7 +708,8 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                         session = "may" if sess_digits == "25" else "november"
                 paper_reference_key = build_paper_reference_key(
                     curriculum="ib", subject=ib_metadata.get("subject_name", ""),
-                    tier=ib_metadata.get("level", ""), session=session, year=year, ref_code_base=ref_code_base
+                    tier=ib_metadata.get("level", ""), session=session, year=year,
+                    ref_code_base=ref_code_base,
                 )
                 extra_metadata["ref_code_base"] = ref_code_base
                 extra_metadata["ref_code_full"] = ref_code.raw
@@ -635,114 +718,153 @@ def _extract_pdf_native_sync(pdf_base64: str, document_type: str, filename: str,
                 print("⚠️  [Gemini Native PDF] Could not extract IB reference code via regex")
 
         needs_review = board.upper() == "IGCSE" and not validation_result["match_status"]
-        if needs_review: print(f"⚠️  [Gemini Native PDF] Metadata verification failed: {validation_result['mismatches']}")
+        if needs_review:
+            print(f"⚠️  [Gemini Native PDF] Metadata verification failed: {validation_result['mismatches']}")
 
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
 
-        primary_model = "gemini-1.5-flash-latest"
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
+        # FIX: Dynamically pick the primary model instead of hardcoding a deprecated one.
+        # FIX: raw_text is now always assigned after the try/except block (not inside except).
+        # FIX: Both model calls use _generate_with_retry for 503/429 resilience.
+        primary_model = _pick_available_model(client)
+        response = None
+
         try:
-            response = client.models.generate_content(
-                model=primary_model, contents=[system_prompt, uploaded_file],
+            response = _generate_with_retry(
+                client, primary_model,
+                contents=[system_prompt, uploaded_file],
                 config={"response_mime_type": "application/json"},
             )
         except Exception as primary_exc:
-            print(f"⚠️  [Gemini Native PDF] Primary model failed ({primary_exc}). Trying fallback…")
+            print(f"⚠️  [Gemini Native PDF] Primary model '{primary_model}' failed ({primary_exc}). Trying fallback…")
             fallback_model = _pick_available_model(client)
             try:
-                response = client.models.generate_content(
-                    model=fallback_model, contents=[system_prompt, uploaded_file],
+                response = _generate_with_retry(
+                    client, fallback_model,
+                    contents=[system_prompt, uploaded_file],
                     config={"response_mime_type": "application/json"},
                 )
             except Exception as fallback_exc:
                 raise PipelineServiceError(
-                    stage="pdf_native_gemini", message="All models failed.",
-                    details={"provider": "gemini", "reason": str(fallback_exc), "exception_type": type(fallback_exc).__name__},
+                    stage="pdf_native_gemini",
+                    message="All models failed.",
+                    details={
+                        "provider": "gemini",
+                        "reason": str(fallback_exc),
+                        "exception_type": type(fallback_exc).__name__,
+                    },
                 ) from fallback_exc
-                
-            raw_text = getattr(response, "text", "") or ""
+
+        # FIX: raw_text is assigned here — outside all try/except blocks — so it is
+        # always defined whether the primary or fallback model was used.
+        raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
-        
+
         if needs_review:
             for question in parsed_dict.get("questions_array", []):
-                if isinstance(question, dict): question["needs_review"] = True
-        
+                if isinstance(question, dict):
+                    question["needs_review"] = True
+
         # ---------------------------------------------------------------------------
-        # CRITICAL FIX: Diagram Crop Logic runs on parsed_dict BEFORE Pydantic models
+        # Diagram Crop Logic — runs on parsed_dict BEFORE Pydantic models
         # ---------------------------------------------------------------------------
         try:
             questions_list = parsed_dict.get("questions_array", [])
-            needs_crop = False
-            
-            for q in questions_list:
-                if isinstance(q, dict):
-                    urls = q.get("diagram_urls", [])
-                    if isinstance(urls, list) and "[NEEDS_CROP]" in urls:
-                        needs_crop = True
-                        break
-                    elif urls == "[NEEDS_CROP]":
-                        needs_crop = True
-                        break
+            needs_crop = any(
+                (isinstance(q, dict) and (
+                    (isinstance(q.get("diagram_urls"), list) and "[NEEDS_CROP]" in q.get("diagram_urls", []))
+                    or q.get("diagram_urls") == "[NEEDS_CROP]"
+                ))
+                for q in questions_list
+            )
 
             if needs_crop:
-                pdf_bytes = base64.b64decode(normalized_b64.split(",", 1)[1] if "," in normalized_b64 else normalized_b64)
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                crop_bytes = base64.b64decode(normalized_b64)
+                doc = fitz.open(stream=crop_bytes, filetype="pdf")
                 try:
                     for q in questions_list:
-                        if isinstance(q, dict):
-                            urls = q.get("diagram_urls", [])
-                            if (isinstance(urls, list) and "[NEEDS_CROP]" in urls) or urls == "[NEEDS_CROP]":
-                                page = doc[0]
-                                rect = page.rect 
-                                pix = page.get_pixmap(clip=rect, colorspace=fitz.csRGB, alpha=False)
-                                image_bytes = pix.tobytes("png")
-                                image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-                                fallback_img = f"data:image/png;base64,{image_b64}"
-                                # Plain python dict mutation is 100% safe
-                                q["diagram_urls"] = [fallback_img]
+                        if not isinstance(q, dict):
+                            continue
+                        urls = q.get("diagram_urls", [])
+                        if (isinstance(urls, list) and "[NEEDS_CROP]" in urls) or urls == "[NEEDS_CROP]":
+                            page_number = max(0, int(q.get("diagram_page_number", 1) or 1) - 1)
+                            page_number = min(page_number, len(doc) - 1)
+                            page = doc[page_number]
+
+                            y_range = q.get("diagram_y_range") or []
+                            if isinstance(y_range, list) and len(y_range) == 2:
+                                try:
+                                    y0 = float(y_range[0]) * page.rect.height
+                                    y1 = float(y_range[1]) * page.rect.height
+                                    clip = fitz.Rect(page.rect.x0, y0, page.rect.x1, y1)
+                                except Exception:
+                                    clip = page.rect
+                            else:
+                                clip = page.rect
+
+                            pix = page.get_pixmap(clip=clip, colorspace=fitz.csRGB, alpha=False)
+                            image_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+                            q["diagram_urls"] = [f"data:image/png;base64,{image_b64}"]
                 finally:
                     doc.close()
         except Exception as e:
-            print(f"⚠️  [Gemini Native PDF] Failed to generate Base64 diagram crop buffer: {e}")
+            print(f"⚠️  [Gemini Native PDF] Diagram crop failed: {e}")
         # ---------------------------------------------------------------------------
-        
+
         normalized_response = _normalize_response(
-            parsed_dict, 
-            filename, 
-            document_type, 
-            board, 
-            paper_reference_key, 
-            extra_metadata=extra_metadata if board.upper() != "IGCSE" else None
+            parsed_dict,
+            filename,
+            document_type,
+            board,
+            paper_reference_key,
+            extra_metadata=extra_metadata if board.upper() != "IGCSE" else None,
         )
         return normalized_response
 
-    except PipelineServiceError: raise
+    except PipelineServiceError:
+        raise
     except Exception as exc:
         print(f"❌ [Gemini Native PDF Error] {type(exc).__name__}: {exc!r}")
         raise PipelineServiceError(
-            stage="pdf_native_gemini", message="Failed to extract structured questions from PDF.",
-            details={"provider": "gemini", "reason": str(exc), "exception_type": type(exc).__name__},
+            stage="pdf_native_gemini",
+            message="Failed to extract structured questions from PDF.",
+            details={
+                "provider": "gemini",
+                "reason": str(exc),
+                "exception_type": type(exc).__name__,
+            },
         ) from exc
     finally:
         if client is not None and uploaded_file is not None:
-            try: client.files.delete(name=uploaded_file.name)
-            except Exception: pass
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
         if temp_file_path and os.path.exists(temp_file_path):
-            try: os.remove(temp_file_path)
-            except Exception: pass
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Public async entry-points
+# Public async entry-point
 # ---------------------------------------------------------------------------
 
-async def extract_pdf_native_gemini(pdf_base64: str, document_type: str, filename: str, board: str = "IGCSE", page1_base64: str = None) -> SlicedQuestionsResponse:
-    """
-    Extract data from PDF using Gemini vision models.
-    """
-    return await asyncio.to_thread(_extract_pdf_native_sync, pdf_base64, document_type, filename, board, page1_base64)
+async def extract_pdf_native_gemini(
+    pdf_base64: str,
+    document_type: str,
+    filename: str,
+    board: str = "IGCSE",
+    page1_base64: str = None,
+) -> SlicedQuestionsResponse:
+    """Extract structured questions from a PDF using Gemini vision models."""
+    return await asyncio.to_thread(
+        _extract_pdf_native_sync, pdf_base64, document_type, filename, board, page1_base64
+    )
 
 
 __all__ = ["extract_pdf_native_gemini"]
