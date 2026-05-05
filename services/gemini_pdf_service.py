@@ -598,26 +598,25 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
 
 
 def _pick_available_model(client: genai.Client) -> str:
-    # FIX: Updated preferred list with current, valid Gemini model IDs
+    # 🚀 Priority set to 2.0 Flash to bypass strict Free Tier limits
     preferred = [
-        "models/gemini-2.5-flash-preview-05-20",
-        "models/gemini-2.5-flash",
         "models/gemini-2.0-flash",
-        "models/gemini-2.0-flash-lite",
-        "models/gemini-1.5-pro",
-        "models/gemini-1.5-flash",
+        "models/gemini-2.0-flash-lite",  # Sasta backup
+        "models/gemini-1.5-flash"        # Aakhri raasta
     ]
+    
     try:
         available = {m.name for m in client.models.list()}
     except Exception:
-        return "gemini-2.0-flash"
+        return "gemini-2.0-flash" # Agar API fail ho list laane mein, tab bhi 2.0 use karo
 
+    # Available list mein se preferred model dhoondho
     for model_name in preferred:
         if model_name in available:
+            # SDK ko bina 'models/' prefix ke naam chahiye hota hai
             return model_name.replace("models/", "")
-    for model_name in available:
-        if model_name.startswith("models/gemini-"):
-            return model_name.replace("models/", "")
+            
+    # Agar kuch match na ho, toh default 2.0 flash bhej do
     return "gemini-2.0-flash"
 
 
