@@ -295,7 +295,7 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   ]
 }}
 CRITICAL RULES:
-1. HIERARCHICAL NUMBERING (MANDATORY): NEVER output standalone sub-question letters like "(a)", "(b)". You MUST ALWAYS prepend the parent question number. Example: Output "4(a)", not just "(a)". If the parent number is not explicitly visible, INFER it from the sequence.
+1. HIERARCHICAL NUMBERING (MANDATORY): You MUST ALWAYS prepend the parent integer to EVERY sub-question. Example: If you see "(a)", you MUST output "4(a)", NEVER just "(a)". If the parent number is not visually next to it, you MUST LOOK BACKWARDS in your extraction history to find the most recent parent integer, or INFER it from the document sequence. Missing the parent integer is a critical failure.
 2. "diagram_urls": If a question contains a diagram, graph, or illustration, output ["[NEEDS_CROP]"].
 3. DIAGRAM OWNERSHIP AND ORPHANS: If you see a diagram right before a sub-question like "(a)", it belongs to that current parent question. Place ["[NEEDS_CROP]"] ONLY in the JSON object for the first sub-part (e.g., "4(a)"). 
 4. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], provide the exact page number (1-indexed).
@@ -538,12 +538,12 @@ def _normalize_response(
 # JSON Parser (UPDATED WITH ITERATIVE AUTO-HEAL)
 # ---------------------------------------------------------------------------
 
-def _parse_json_payload(raw_text: str) -> dict:
-    if not raw_text:
+def _parse_json_payload(content: str) -> dict:
+    if not content or not content.strip():
         return {"metadata": {}, "questions_array": []}
     
     # 1. Clean markdown formatting
-    cleaned_text = raw_text.strip()
+    cleaned_text = content.strip()
     if cleaned_text.startswith("```json"):
         cleaned_text = cleaned_text[7:]
     elif cleaned_text.startswith("```"):
@@ -555,7 +555,7 @@ def _parse_json_payload(raw_text: str) -> dict:
 
     # 2. SMART REGEX FOR LATEX
     # Matches a backslash NOT preceded by a backslash (ignores \\),
-    # and NOT followed by a quote ("), backslash (\), or newline (n).
+    # and NOT followed by a quote ("), backslash (\\), or newline (n).
     cleaned_text = re.sub(r'(?<!\\)\\(?!["\\n])', r'\\\\', cleaned_text)
 
     # 3. ITERATIVE AUTO-HEAL LOOP
@@ -571,7 +571,7 @@ def _parse_json_payload(raw_text: str) -> dict:
                     pos -= 1
                 
                 if cleaned_text[pos] == '\\':
-                    cleaned_text = cleaned_text[:pos] + '\\' + cleaned_text[pos:]
+                    cleaned_text = cleaned_text[:pos] + '\\\\' + cleaned_text[pos:]
                     continue  # Retry parsing
                 else:
                     print(f"CRITICAL PARSE FAIL (Auto-Heal Failed): {err_msg}")
