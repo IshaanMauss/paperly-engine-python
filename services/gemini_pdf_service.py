@@ -597,62 +597,60 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
 
-def _pick_available_model(client: genai.Client) -> str:
-    # 🚀 Priority set to 2.0 Flash to bypass strict Free Tier limits
-    preferred = [
-        "models/gemini-2.0-flash",
-        "models/gemini-2.0-flash-lite",  # Sasta backup
-        "models/gemini-1.5-flash"        # Aakhri raasta
-    ]
-    
-    try:
-        available = {m.name for m in client.models.list()}
-    except Exception:
-        return "gemini-2.0-flash" # Agar API fail ho list laane mein, tab bhi 2.0 use karo
-
-    # Available list mein se preferred model dhoondho
-    for model_name in preferred:
-        if model_name in available:
-            # SDK ko bina 'models/' prefix ke naam chahiye hota hai
-            return model_name.replace("models/", "")
-            
-    # Agar kuch match na ho, toh default 2.0 flash bhej do
-    return "gemini-2.0-flash"
-
-
 # ---------------------------------------------------------------------------
-# FIX: Retry helper for transient 503 / rate-limit errors
+# Model priority — change this list to update preference order globally
 # ---------------------------------------------------------------------------
 
-def _generate_with_retry(
+_MODEL_PRIORITY: list[str] = [
+    "gemini-2.5-flash",   # Primary — always try first
+    "gemini-2.0-flash",   # First fallback
+    "gemini-1.5-flash",   # Last resort
+]
+
+
+def _pick_available_model(
     client: genai.Client,
-    model: str,
-    contents: list,
-    config: dict,
-    retries: int = 3,
-    delay: float = 5.0,
-):
-    """Wraps generate_content with simple retry logic for transient server errors."""
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            return client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
-            )
-        except Exception as e:
-            last_exc = e
-            err_str = str(e)
-            is_transient = "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str or "RESOURCE_EXHAUSTED" in err_str
-            if is_transient and attempt < retries - 1:
-                wait = delay * (attempt + 1)
-                print(f"⚠️  [Gemini] Transient error on attempt {attempt + 1}/{retries}, retrying in {wait:.0f}s… ({e})")
-                time.sleep(wait)
-                continue
-            raise
-    raise last_exc
+    exclude: list[str] | None = None,
+) -> str:
+    """
+    Returns the highest-priority available Gemini model (no 'models/' prefix).
 
+    Fetches the live model list from the API and walks _MODEL_PRIORITY in order,
+    returning the first name that is both available and not in `exclude`.
+
+    Args:
+        client:  Authenticated Gemini client.
+        exclude: Model names already tried (used to select distinct fallbacks).
+    """
+    exclude_set: set[str] = set(exclude or [])
+
+    try:
+        # Strip the 'models/' prefix that the API returns so names are
+        # directly comparable to the strings in _MODEL_PRIORITY.
+        available: set[str] = {
+            m.name.replace("models/", "")
+            for m in client.models.list()
+        }
+    except Exception as list_exc:
+        # If the listing call itself fails, proceed with the priority list
+        # unfiltered — the generate call will surface any real error.
+        print(f"⚠️  [_pick_available_model] Could not fetch model list: {list_exc}. "
+              "Proceeding with priority defaults.")
+        available = set(_MODEL_PRIORITY)
+
+    # First pass: confirmed available AND not excluded
+    for model_name in _MODEL_PRIORITY:
+        if model_name not in exclude_set and model_name in available:
+            return model_name
+
+    # Second pass: not excluded, even if not confirmed in listing
+    # (handles accounts where listing is restricted but the model still works)
+    for model_name in _MODEL_PRIORITY:
+        if model_name not in exclude_set:
+            return model_name
+
+    # Absolute last resort — should never be reached in practice
+    return _MODEL_PRIORITY[0]
 
 # ---------------------------------------------------------------------------
 # Core extraction (sync, runs in a thread)
@@ -728,23 +726,36 @@ def _extract_pdf_native_sync(
         # FIX: Dynamically pick the primary model instead of hardcoding a deprecated one.
         # FIX: raw_text is now always assigned after the try/except block (not inside except).
         # FIX: Both model calls use _generate_with_retry for 503/429 resilience.
+        # ── Model selection & generation ────────────────────────────────────
+        # primary_model is always dynamically resolved — never hardcoded.
         primary_model = _pick_available_model(client)
         response = None
 
         try:
             response = _generate_with_retry(
-                client, primary_model,
+                client,
+                primary_model,
                 contents=[system_prompt, uploaded_file],
                 config={"response_mime_type": "application/json"},
+                retries=3,
+                delay=5.0,
             )
         except Exception as primary_exc:
-            print(f"⚠️  [Gemini Native PDF] Primary model '{primary_model}' failed ({primary_exc}). Trying fallback…")
-            fallback_model = _pick_available_model(client)
+            print(
+                f"⚠️  [Gemini Native PDF] Primary model '{primary_model}' failed "
+                f"({primary_exc}). Trying fallback…"
+            )
+            # Exclude the already-failed primary so _pick_available_model
+            # returns the *next* model in priority — not the same one again.
+            fallback_model = _pick_available_model(client, exclude=[primary_model])
             try:
                 response = _generate_with_retry(
-                    client, fallback_model,
+                    client,
+                    fallback_model,
                     contents=[system_prompt, uploaded_file],
                     config={"response_mime_type": "application/json"},
+                    retries=3,
+                    delay=5.0,
                 )
             except Exception as fallback_exc:
                 raise PipelineServiceError(
@@ -757,10 +768,13 @@ def _extract_pdf_native_sync(
                     },
                 ) from fallback_exc
 
-        # FIX: raw_text is assigned here — outside all try/except blocks — so it is
-        # always defined whether the primary or fallback model was used.
+        # ── raw_text is assigned HERE — outside every try/except ─────────────
+        # This guarantees it is always defined whether the primary or the
+        # fallback model was used, preventing any NameError downstream.
         raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
+
+        
 
         if needs_review:
             for question in parsed_dict.get("questions_array", []):
