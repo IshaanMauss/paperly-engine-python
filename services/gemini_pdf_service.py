@@ -22,14 +22,6 @@ from builders.key_builder import build_paper_reference_key
 def _generate_igcse_paper_reference_key(filename: str) -> str:
     """
     Derive a canonical slug from the IGCSE filename.
-
-    Supported patterns (case-insensitive):
-      0607_s18_ms_22   ->  igcse_0607_s18_ms_22
-      0580_w21_qp_41   ->  igcse_0580_w21_qp_41
-      0580_m22_ms_12   ->  igcse_0580_m22_ms_12
-
-    Season codes: s = May/June, w = Oct/Nov, m = Feb/March
-    Falls back to empty string if the filename doesn't match.
     """
     if not filename:
         return ""
@@ -228,9 +220,8 @@ CRITICAL RULES:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builders
+# Prompt builders (UPDATED WITH ANTI-CROP OVERRIDE)
 # ---------------------------------------------------------------------------
-
 
 def _build_pdf_system_prompt(document_type: str, paper_reference_key: str = "") -> str:
     LATEX_RULES = """
@@ -543,6 +534,10 @@ def _normalize_response(
     )
 
 
+# ---------------------------------------------------------------------------
+# JSON Parser (UPDATED WITH ITERATIVE AUTO-HEAL)
+# ---------------------------------------------------------------------------
+
 def _parse_json_payload(raw_text: str) -> dict:
     if not raw_text:
         return {"metadata": {}, "questions_array": []}
@@ -558,17 +553,34 @@ def _parse_json_payload(raw_text: str) -> dict:
     
     cleaned_text = cleaned_text.strip()
 
-    # 2. AUTO-HEAL LATEX ESCAPES (THE MAGIC FIX)
-    # This regex finds single backslashes that are NOT followed by valid JSON escape chars 
-    # (like ", \\, /, b, f, n, r, t, u) and doubles them so Python json.loads() doesn\"t crash.
-    cleaned_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned_text)
+    # 2. SMART REGEX FOR LATEX
+    # Matches a backslash NOT preceded by a backslash (ignores \\),
+    # and NOT followed by a quote ("), backslash (\), or newline (n).
+    cleaned_text = re.sub(r'(?<!\\)\\(?!["\\n])', r'\\\\', cleaned_text)
 
-    try:
-        parsed_dict = json.loads(cleaned_text)
-        return parsed_dict
-    except json.JSONDecodeError as e:
-        print(f"CRITICAL PARSE FAIL: {e}")
-        return {"metadata": {}, "questions_array": []}
+    # 3. ITERATIVE AUTO-HEAL LOOP
+    for attempt in range(10):
+        try:
+            parsed_dict = json.loads(cleaned_text)
+            return parsed_dict
+        except json.JSONDecodeError as e:
+            err_msg = str(e)
+            if "Invalid \\escape" in err_msg or "Invalid \\u" in err_msg:
+                pos = e.pos
+                while pos > 0 and cleaned_text[pos] != '\\':
+                    pos -= 1
+                
+                if cleaned_text[pos] == '\\':
+                    cleaned_text = cleaned_text[:pos] + '\\' + cleaned_text[pos:]
+                    continue  # Retry parsing
+                else:
+                    print(f"CRITICAL PARSE FAIL (Auto-Heal Failed): {err_msg}")
+                    break
+            else:
+                print(f"CRITICAL PARSE FAIL (Structure Error): {err_msg}")
+                break
+                
+    return {"metadata": {}, "questions_array": []}
 
 
 # ---------------------------------------------------------------------------
@@ -664,23 +676,15 @@ def _pick_available_model(
 
     Fetches the live model list from the API and walks _MODEL_PRIORITY in order,
     returning the first name that is both available and not in `exclude`.
-
-    Args:
-        client:  Authenticated Gemini client.
-        exclude: Model names already tried (used to select distinct fallbacks).
     """
     exclude_set: set[str] = set(exclude or [])
 
     try:
-        # Strip the 'models/' prefix that the API returns so names are
-        # directly comparable to the strings in _MODEL_PRIORITY.
         available: set[str] = {
             m.name.replace("models/", "")
             for m in client.models.list()
         }
     except Exception as list_exc:
-        # If the listing call itself fails, proceed with the priority list
-        # unfiltered — the generate call will surface any real error.
         print(f"⚠️  [_pick_available_model] Could not fetch model list: {list_exc}. "
               "Proceeding with priority defaults.")
         available = set(_MODEL_PRIORITY)
@@ -691,17 +695,15 @@ def _pick_available_model(
             return model_name
 
     # Second pass: not excluded, even if not confirmed in listing
-    # (handles accounts where listing is restricted but the model still works)
     for model_name in _MODEL_PRIORITY:
         if model_name not in exclude_set:
             return model_name
 
-    # Absolute last resort — should never be reached in practice
     return _MODEL_PRIORITY[0]
 
 
 # ---------------------------------------------------------------------------
-# Core extraction (sync, runs in a thread)
+# Core extraction (sync, runs in a thread) (UPDATED WITH MODEL PRIORITY LOOP)
 # ---------------------------------------------------------------------------
 
 def _extract_pdf_native_sync(
@@ -772,50 +774,43 @@ def _extract_pdf_native_sync(
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
         # ── Model selection & generation ─────────────────────────────────────
-        # primary_model is always dynamically resolved — never hardcoded.
-        primary_model = _pick_available_model(client)
+        # Loops through ALL models in priority order before raising.
         response = None
-
-        try:
-            response = _generate_with_retry(
-                client,
-                primary_model,
-                contents=[system_prompt, uploaded_file],
-                config={"response_mime_type": "application/json"},
-                retries=3,
-                delay=5.0,
-            )
-        except Exception as primary_exc:
-            print(
-                f"⚠️  [Gemini Native PDF] Primary model '{primary_model}' failed "
-                f"({primary_exc}). Trying fallback…"
-            )
-            # Exclude the already-failed primary so _pick_available_model
-            # returns the *next* model in priority — not the same one again.
-            fallback_model = _pick_available_model(client, exclude=[primary_model])
+        last_exc = None
+        
+        for model_name in _MODEL_PRIORITY:
             try:
+                print(f"ℹ️  [Gemini Native PDF] Trying model '{model_name}'…")
                 response = _generate_with_retry(
                     client,
-                    fallback_model,
+                    model=model_name,  
                     contents=[system_prompt, uploaded_file],
                     config={"response_mime_type": "application/json"},
                     retries=3,
                     delay=5.0,
                 )
-            except Exception as fallback_exc:
-                raise PipelineServiceError(
-                    stage="pdf_native_gemini",
-                    message="All models failed.",
-                    details={
-                        "provider": "gemini",
-                        "reason": str(fallback_exc),
-                        "exception_type": type(fallback_exc).__name__,
-                    },
-                ) from fallback_exc
+                print(f"✅ [Gemini Native PDF] Model '{model_name}' succeeded.")
+                break  # stop as soon as one model works
+            except Exception as exc:
+                print(
+                    f"⚠️  [Gemini Native PDF] Model '{model_name}' failed "
+                    f"({exc}). Trying next…"
+                )
+                last_exc = exc
+                continue
+                
+        if response is None:
+            raise PipelineServiceError(
+                stage="pdf_native_gemini",
+                message="All models failed.",
+                details={
+                    "provider": "gemini",
+                    "reason": str(last_exc),
+                    "exception_type": type(last_exc).__name__,
+                },
+            )
 
         # ── raw_text assigned HERE — outside every try/except ────────────────
-        # Guaranteed to be defined whether primary or fallback model was used.
-        # Prevents NameError on successful primary calls.
         raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
 
