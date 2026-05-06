@@ -231,6 +231,7 @@ CRITICAL RULES:
 # Prompt builders
 # ---------------------------------------------------------------------------
 
+
 def _build_pdf_system_prompt(document_type: str, paper_reference_key: str = "") -> str:
     LATEX_RULES = """
 STRICT LATEX ESCAPING (MANDATORY)
@@ -244,7 +245,6 @@ STRICT LATEX ESCAPING (MANDATORY)
         if paper_reference_key else '\n- "paper_reference_key": set to "" if you cannot determine it.'
     )
 
-    # ── Marking-scheme branch ────────────────────────────────────────────────
     if (document_type or "").strip().lower() == "marking scheme":
         return f"""
 You are an IGCSE/IB mathematics MARKING SCHEME extraction engine.
@@ -277,10 +277,8 @@ CRITICAL RULES:
 {LATEX_RULES}
 """.strip()
 
-    # ── Regular question-paper branch ────────────────────────────────────────
     return f"""
 You are an IGCSE/IB mathematics question extraction engine.
-
 TARGET
 - You MUST read the ENTIRE document, not just the first page. Extract EVERY math question. Analyze the FIRST PAGE to extract metadata.
 
@@ -306,11 +304,11 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   ]
 }}
 CRITICAL RULES:
-1. HIERARCHICAL NUMBERING (MANDATORY): NEVER output standalone sub-question letters like "(a)", "(b)", or "(i)". You MUST ALWAYS prepend the parent question number. Example: Output "4(a)", not just "(a)". If the parent number is not explicitly visible next to the sub-question, you MUST INFER it from the sequence of the document.
+1. HIERARCHICAL NUMBERING (MANDATORY): NEVER output standalone sub-question letters like "(a)", "(b)". You MUST ALWAYS prepend the parent question number. Example: Output "4(a)", not just "(a)". If the parent number is not explicitly visible, INFER it from the sequence.
 2. "diagram_urls": If a question contains a diagram, graph, or illustration, output ["[NEEDS_CROP]"].
-3. DIAGRAM OWNERSHIP AND ORPHANS: If you see a diagram right before a sub-question like "(a)", it belongs to that current parent question. Place ["[NEEDS_CROP]"] ONLY in the JSON object for the first sub-part (e.g., "4(a)"). NEVER accidentally append it to the previous question's last sub-part (e.g., "3(c)") just because the parent number "4" was faintly printed.
-4. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], you MUST provide the exact page number (1, 2, 3...) where the diagram is.
-5. "diagram_y_range": CRITICAL. Give the approximate vertical location of the diagram on the page as a ratio from 0.0 (top) to 1.0 (bottom). Example: [0.20, 0.45]. Empty array [] if no diagram.
+3. DIAGRAM OWNERSHIP AND ORPHANS: If you see a diagram right before a sub-question like "(a)", it belongs to that current parent question. Place ["[NEEDS_CROP]"] ONLY in the JSON object for the first sub-part (e.g., "4(a)"). 
+4. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], provide the exact page number (1-indexed).
+5. "diagram_y_range" (ANTI-CROP OVERRIDE): CRITICAL. You MUST capture the ABSOLUTE FULL HEIGHT of the image. Identify the extreme topmost pixel and bottommost pixel. Then, intentionally EXPAND the box by adding at least 0.05 extra whitespace ABOVE and 0.05 extra whitespace BELOW. NEVER output tight bounding boxes. Example: If it sits between 0.30 and 0.50, output [0.25, 0.55]. Empty array [] if no diagram.
 6. Duplicate ALL metadata fields inside EVERY question object.
 {prk_instruction}
 {LATEX_RULES}
@@ -545,24 +543,31 @@ def _normalize_response(
     )
 
 
-def _parse_json_payload(content: str) -> dict:
-    if not content or not content.strip():
+def _parse_json_payload(raw_text: str) -> dict:
+    if not raw_text:
         return {"metadata": {}, "questions_array": []}
+    
+    # 1. Clean markdown formatting
+    cleaned_text = raw_text.strip()
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text[7:]
+    elif cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text[3:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3]
+    
+    cleaned_text = cleaned_text.strip()
+
+    # 2. AUTO-HEAL LATEX ESCAPES (THE MAGIC FIX)
+    # This regex finds single backslashes that are NOT followed by valid JSON escape chars 
+    # (like ", \\, /, b, f, n, r, t, u) and doubles them so Python json.loads() doesn\"t crash.
+    cleaned_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned_text)
+
     try:
-        cleaned_content = re.sub(r'^```json\s*', '', content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'^```\s*', '', cleaned_content, flags=re.MULTILINE)
-        return json.loads(cleaned_content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            json_str = content[start: end + 1]
-            json_str = re.sub(r'[\x00-\x1F]+', ' ', json_str)
-            try:
-                return json.loads(json_str)
-            except json.JSONDecodeError as final_err:
-                print(f"CRITICAL PARSE FAIL: {final_err}")
-                return {"metadata": {}, "questions_array": []}
+        parsed_dict = json.loads(cleaned_text)
+        return parsed_dict
+    except json.JSONDecodeError as e:
+        print(f"CRITICAL PARSE FAIL: {e}")
         return {"metadata": {}, "questions_array": []}
 
 
@@ -847,12 +852,17 @@ def _extract_pdf_native_sync(
 
                             y_range = q.get("diagram_y_range") or []
                             if isinstance(y_range, list) and len(y_range) == 2:
-                                try:
-                                    y0 = float(y_range[0]) * page.rect.height
-                                    y1 = float(y_range[1]) * page.rect.height
-                                    clip = fitz.Rect(page.rect.x0, y0, page.rect.x1, y1)
-                                except Exception:
-                                    clip = page.rect
+                                  try:
+                                      # Add 5% safety padding to avoid cutting top/bottom boundaries
+                                      PADDING = 0.05
+                                      safe_y0 = max(0.0, float(y_range[0]) - PADDING)
+                                      safe_y1 = min(1.0, float(y_range[1]) + PADDING)
+
+                                      y0 = safe_y0 * page.rect.height
+                                      y1 = safe_y1 * page.rect.height
+                                      clip = fitz.Rect(page.rect.x0, y0, page.rect.x1, y1)
+                                  except Exception:
+                                      clip = page.rect
                             else:
                                 clip = page.rect
 
