@@ -598,6 +598,46 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
 
 
 # ---------------------------------------------------------------------------
+# Retry helper for transient 503 / rate-limit errors
+# ---------------------------------------------------------------------------
+
+def _generate_with_retry(
+    client: genai.Client,
+    model: str,
+    contents: list,
+    config: dict,
+    retries: int = 3,
+    delay: float = 5.0,
+):
+    """Wraps generate_content with exponential-step retry for transient errors."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)
+            is_transient = any(
+                code in err_str
+                for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
+            )
+            if is_transient and attempt < retries - 1:
+                wait = delay * (attempt + 1)   # 5s → 10s → 15s
+                print(
+                    f"⚠️  [Gemini] Transient error on attempt {attempt + 1}/{retries}, "
+                    f"retrying in {wait:.0f}s… ({e})"
+                )
+                time.sleep(wait)
+                continue
+            raise   # non-transient or final attempt — propagate immediately
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
 # Model priority — change this list to update preference order globally
 # ---------------------------------------------------------------------------
 
@@ -651,6 +691,7 @@ def _pick_available_model(
 
     # Absolute last resort — should never be reached in practice
     return _MODEL_PRIORITY[0]
+
 
 # ---------------------------------------------------------------------------
 # Core extraction (sync, runs in a thread)
@@ -723,10 +764,7 @@ def _extract_pdf_native_sync(
 
         system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
 
-        # FIX: Dynamically pick the primary model instead of hardcoding a deprecated one.
-        # FIX: raw_text is now always assigned after the try/except block (not inside except).
-        # FIX: Both model calls use _generate_with_retry for 503/429 resilience.
-        # ── Model selection & generation ────────────────────────────────────
+        # ── Model selection & generation ─────────────────────────────────────
         # primary_model is always dynamically resolved — never hardcoded.
         primary_model = _pick_available_model(client)
         response = None
@@ -768,13 +806,11 @@ def _extract_pdf_native_sync(
                     },
                 ) from fallback_exc
 
-        # ── raw_text is assigned HERE — outside every try/except ─────────────
-        # This guarantees it is always defined whether the primary or the
-        # fallback model was used, preventing any NameError downstream.
+        # ── raw_text assigned HERE — outside every try/except ────────────────
+        # Guaranteed to be defined whether primary or fallback model was used.
+        # Prevents NameError on successful primary calls.
         raw_text = getattr(response, "text", "") or ""
         parsed_dict = _parse_json_payload(raw_text)
-
-        
 
         if needs_review:
             for question in parsed_dict.get("questions_array", []):
