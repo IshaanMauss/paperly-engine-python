@@ -306,10 +306,12 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   ]
 }}
 CRITICAL RULES:
-1. "diagram_urls": If a question contains a diagram, graph, or illustration, output ["[NEEDS_CROP]"].
-2. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], you MUST provide the exact page number (1, 2, 3...) where the diagram is.
-3. "diagram_y_range": CRITICAL. Give the approximate vertical location of the diagram on the page as a ratio from 0.0 (top) to 1.0 (bottom). Example: [0.20, 0.45]. Empty array [] if no diagram.
-4. Duplicate ALL metadata fields inside EVERY question object.
+1. HIERARCHICAL NUMBERING (MANDATORY): NEVER output standalone sub-question letters like "(a)", "(b)", or "(i)". You MUST ALWAYS prepend the parent question number. Example: Output "4(a)", not just "(a)". If the parent number is not explicitly visible next to the sub-question, you MUST INFER it from the sequence of the document.
+2. "diagram_urls": If a question contains a diagram, graph, or illustration, output ["[NEEDS_CROP]"].
+3. DIAGRAM OWNERSHIP AND ORPHANS: If you see a diagram right before a sub-question like "(a)", it belongs to that current parent question. Place ["[NEEDS_CROP]"] ONLY in the JSON object for the first sub-part (e.g., "4(a)"). NEVER accidentally append it to the previous question's last sub-part (e.g., "3(c)") just because the parent number "4" was faintly printed.
+4. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], you MUST provide the exact page number (1, 2, 3...) where the diagram is.
+5. "diagram_y_range": CRITICAL. Give the approximate vertical location of the diagram on the page as a ratio from 0.0 (top) to 1.0 (bottom). Example: [0.20, 0.45]. Empty array [] if no diagram.
+6. Duplicate ALL metadata fields inside EVERY question object.
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
