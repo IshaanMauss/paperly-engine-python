@@ -642,9 +642,9 @@ def _generate_with_retry(
 # ---------------------------------------------------------------------------
 
 _MODEL_PRIORITY: list[str] = [
-    "gemini-2.5-flash",   # Primary — always try first
-    "gemini-2.0-flash",   # First fallback
-    "gemini-1.5-flash",   # Last resort
+    "gemini-2.5-flash",       # Primary
+    "gemini-2.5-flash-lite",  # Lighter, separate quota, less congestion
+    "gemini-1.5-flash",       # Old but stable last resort
 ]
 
 
