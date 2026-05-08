@@ -374,9 +374,11 @@ OUTPUT FORMAT — return ONLY the following JSON object:
 CRITICAL RULES:
 1. HIERARCHICAL NUMBERING (MANDATORY): Prepend the parent integer to EVERY sub-question. Example: If you see "(a)", you MUST output "4(a)".
 2. INFERRED NUMBERING & SEQUENCE (CRITICAL): If a question does not have a visible number, you MUST infer its identity from the sequence.
-3. "diagram_urls": If a question contains a diagram, output ["[NEEDS_CROP]"].
+3. STRICT DIAGRAM DETECTION ("diagram_urls"): ONLY output ["[NEEDS_CROP]"] if you physically see an ACTUAL visual element. 
+   ✅ ALLOWED: Geometry figures, trigonometry triangles, graphs, coordinate grids, statistical charts, data tables, 2D/3D shapes.
+   ❌ FORBIDDEN: NEVER trigger for blank spaces, ruled lines, empty working areas, or just because the text says "Draw a histogram/graph".
 4. DIAGRAM OWNERSHIP: If a diagram appears before sub-parts (a), (b), attach it ONLY to the first sub-part (e.g., "4(a)").
-5. "diagram_y_range": Intentionally EXPAND the crop box by adding 0.05 extra whitespace ABOVE and BELOW the extreme pixels.
+5. "diagram_y_range": The bounding box MUST strictly wrap the visual element. DO NOT include massive empty spaces. Intentionally EXPAND the crop box by adding 0.05 extra whitespace ABOVE and BELOW the extreme pixels.
 6. Duplicate ALL metadata fields inside EVERY question object.
 7. {difficulty_rule}
 {prk_instruction}
