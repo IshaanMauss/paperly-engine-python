@@ -4,6 +4,17 @@ from typing import List, Optional, Any
 
 
 # ---------------------------------------------------------------------------
+# Question Number Metadata
+# ---------------------------------------------------------------------------
+
+class QuestionNumberMetadata(BaseModel):
+    parent: Optional[int] = Field(None, description="The main question number (e.g., 4 for 4(a))")
+    subparts: List[str] = Field(default_factory=list, description="List of subpart identifiers (e.g., [\"a\", \"i\"] for 4(a)(i))")
+    depth: Optional[int] = Field(1, description="Hierarchy depth of the question (1 for main, 2 for sub-part, etc.)")
+    is_orphaned: Optional[bool] = Field(False, description="True if this question is a sub-part but its parent is missing or ill-defined.")
+
+
+# ---------------------------------------------------------------------------
 # MS Training Schema — method_steps item
 # ---------------------------------------------------------------------------
 
@@ -39,6 +50,13 @@ class ExtractedQuestion(BaseModel):
         description="Slug that links a QP to its MS. Format: YEAR_SUBJECT_PAPER_VARIANT. "
                     "Generated from the filename by the pipeline.",
     )
+    unified_paper_key: Optional[str] = Field("", description="Canonical paper key for linking QP and MS (e.g., igcse_0607_m25_22)")
+    canonical_question_id: Optional[str] = Field("", description="Canonical question ID (e.g., 4(a))")
+    parent_canonical_id: Optional[str] = Field("", description="Parent canonical question ID (e.g., 4 for 4(a))")
+    question_number_metadata: Optional[QuestionNumberMetadata] = Field(default_factory=QuestionNumberMetadata, description="Structured metadata for question numbering.")
+    validation_status: Optional[str] = Field("pending", description="Validation status of the question (ok, warning, error, pending)")
+    validation_warnings: Optional[List[str]] = Field(default_factory=list, description="List of validation warnings for this question.")
+    
     ref_code_base: Optional[str] = Field("", description="Base reference code without suffix (e.g., 2225-7106)")
     ref_code_full: Optional[str] = Field("", description="Full reference code with suffix (e.g., 2225-7106M)")
 
@@ -66,6 +84,24 @@ class ExtractedQuestion(BaseModel):
     needs_review: Optional[bool] = Field(
         False,
         description="Flag if the question needs human review.",
+    )
+
+    # ── Difficulty Classification ─────────────────────────────────────────────
+    cognitive_demand: Optional[str] = Field(
+        "MEDIUM",
+        description=(
+            "AI-generated cognitive demand level based on IB/IGCSE command terms and mark allocation. "
+            "Values: 'LOW' (State, Define, 1 mark), 'MEDIUM' (Explain, Calculate, 2-3 marks), "
+            "'HIGH' (Evaluate, Analyse, 4+ marks). Set by Gemini; never modified by the pipeline."
+        ),
+    )
+    difficulty_override: Optional[str] = Field(
+        None,
+        description=(
+            "Manual difficulty rating set by a human reviewer on the dashboard. "
+            "Values: 'Easy', 'Medium', 'Hard', or null (no override). "
+            "Dashboard filter resolves as: difficulty_override ?? cognitive_demand."
+        ),
     )
 
     # ── MS Training Schema fields ─────────────────────────────────────────────
@@ -107,8 +143,23 @@ class ExtractedPaperMetadata(BaseModel):
         "",
         description="Slug that links QP ↔ MS. Generated from filename. Format: YEAR_SUBJECT_PAPER_VARIANT.",
     )
+    unified_paper_key: Optional[str] = Field("", description="Canonical paper key for linking QP and MS (e.g., igcse_0607_m25_22)")
+    validation_status: Optional[str] = Field("pending", description="Validation status of the paper (ok, warning, error, pending)")
+    validation_warnings: Optional[List[str]] = Field(default_factory=list, description="List of validation warnings for this paper.")
+    
     ref_code_base: Optional[str] = Field("", description="Base reference code without suffix (e.g., 2225-7106)")
     ref_code_full: Optional[str] = Field("", description="Full reference code with suffix (e.g., 2225-7106M)")
+
+
+# ---------------------------------------------------------------------------
+# Validation Report
+# ---------------------------------------------------------------------------
+
+class ValidationReport(BaseModel):
+    status: str = Field("ok", description="Overall validation status: 'ok', 'warning', or 'error'")
+    recommendation: str = Field("proceed", description="Action to take: 'proceed', 'review', or 'block'")
+    message: str = Field("", description="Human-readable summary of validation results")
+    checks: dict = Field(default_factory=dict, description="Detailed results of specific checks (parity, sequence, etc.)")
 
 
 # ---------------------------------------------------------------------------
@@ -123,4 +174,8 @@ class SlicedQuestionsResponse(BaseModel):
     questions_array: Optional[List[ExtractedQuestion]] = Field(
         default_factory=list,
         description="List of all questions (QP) or marking scheme entries (MS) extracted from the document.",
+    )
+    validation_report: Optional[ValidationReport] = Field(
+        default_factory=ValidationReport,
+        description="Report containing results of pre-flight validation checks."
     )

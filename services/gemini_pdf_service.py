@@ -9,10 +9,11 @@ import time
 import fitz
 from google import genai
 
-from schemas.ingestion_schema import ExtractedQuestion, ExtractedPaperMetadata, SlicedQuestionsResponse
+from schemas.ingestion_schema import ExtractedQuestion, ExtractedPaperMetadata, SlicedQuestionsResponse, QuestionNumberMetadata, ValidationReport
 from services.pipeline_errors import PipelineServiceError
 from extractors.ref_code_extractor import regex_extract_ref_code
 from builders.key_builder import build_paper_reference_key
+from utils.question_normalizer import QuestionNumberNormalizer
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,7 @@ CRITICAL RULES:
 # Prompt builders (UPDATED WITH ANTI-CROP OVERRIDE)
 # ---------------------------------------------------------------------------
 
-def _build_pdf_system_prompt(document_type: str, paper_reference_key: str = "") -> str:
+def _build_pdf_system_prompt(document_type: str, paper_reference_key: str = "", board: str = "IGCSE") -> str:
     LATEX_RULES = """
 STRICT LATEX ESCAPING (MANDATORY)
 - Extract ALL math as raw LaTeX. Use $...$ for inline and $$...$$ for block.
@@ -236,19 +237,89 @@ STRICT LATEX ESCAPING (MANDATORY)
         if paper_reference_key else '\n- "paper_reference_key": set to "" if you cannot determine it.'
     )
 
+    # ── Curriculum-aware difficulty rules ────────────────────────────────────
+    board_upper = board.upper()
+
+    if board_upper == "IB":
+        difficulty_rule = """
+DIFFICULTY & COGNITIVE DEMAND (IB — AO-BASED):
+Command term is PRIMARY. Mark count is FALLBACK only when no command term is visible.
+
+  LOW  (AO1 – Recall):
+       State, Write down, List, Label, Draw, Plot, Define, Identify, Name.
+       Mark fallback: 1–2 marks.
+
+  MEDIUM (AO2 – Application):
+       Find, Calculate, Show, "Show that", Determine, Solve, Construct,
+       Sketch, Verify, Justify, Apply, Complete, Describe, "Write an expression for".
+       Mark fallback: 3–5 marks.
+
+  HIGH (AO3/AO4 – Analysis & Evaluation):
+       Derive, Prove, Explain, Analyse, Interpret, Comment, Discuss, Evaluate,
+       Suggest, Deduce, "Hence", "Hence or otherwise", "Find the exact value of"
+       (multi-step), "To what extent".
+       Mark fallback: 6+ marks.
+
+Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override" to null.
+""".strip()
+
+    elif board_upper in ("IGCSE", "CAMBRIDGE"):
+        difficulty_rule = """
+DIFFICULTY & COGNITIVE DEMAND (IGCSE — MARK-DRIVEN):
+Mark count is PRIMARY. Command term is secondary confirmation.
+
+  LOW   (1 mark):
+        State, Write down, Name, Identify, List, Label, Recall,
+        "Write down the mathematical name of".
+
+  MEDIUM (2 marks):
+        Work out, Find, Calculate, Expand, Factorise, Simplify, Solve,
+        Describe, Construct, Complete, Measure, "Give your answer in",
+        "Show your working".
+
+  HIGH  (3+ marks  OR  any of these command patterns regardless of marks):
+        "Make [variable] the subject of",
+        "Show that", "Prove that",
+        "Draw a [histogram / graph / cumulative frequency curve / sketch]",
+        "Find [expression] in terms of [variable]",
+        "Find the average [speed / rate / density]",
+        "Hence show", "Hence or otherwise",
+        Derive, Analyse, Evaluate, Discuss, Justify.
+
+Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override" to null.
+""".strip()
+
+    elif board_upper in ("A-LEVEL", "ALEVEL"):
+        difficulty_rule = """
+DIFFICULTY & COGNITIVE DEMAND (A-LEVEL — MARK-DRIVEN):
+  LOW    = 1–2 marks.
+  MEDIUM = 3–5 marks.
+  HIGH   = 6+ marks OR: Prove, Derive, "Show that", Evaluate, Discuss.
+Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override" to null.
+""".strip()
+
+    else:
+        print(f"⚠️  [Difficulty] Unknown board '{board}', using IGCSE rules as fallback.")
+        difficulty_rule = """
+DIFFICULTY & COGNITIVE DEMAND:
+  LOW = 1 mark. MEDIUM = 2–3 marks. HIGH = 4+ marks.
+Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override" to null.
+""".strip()
+
+    # ── MS prompt ─────────────────────────────────────────────────────────────
     if (document_type or "").strip().lower() == "marking scheme":
         return f"""
-You are an IGCSE/IB mathematics MARKING SCHEME extraction engine.
+You are an {board} mathematics MARKING SCHEME extraction engine.
 OUTPUT FORMAT — return ONLY the following JSON object:
 {{
   "metadata": {{
-    "curriculum": "<string>", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
+    "curriculum": "{board}", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
     "paperNumber": <integer, 0 if unknown>, "session": "<string or null>", "year": <integer, 0 if unknown>, "paper_reference_key": "<string>"
   }},
   "questions_array": [
     {{
       "document_type": "Marking Scheme",
-      "curriculum": "<string>", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
+      "curriculum": "{board}", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
       "paperNumber": <integer>, "session": "<string or null>", "year": <integer>, "paper_reference_key": "<string>",
       "isTemplatizable": false, "variables": [],
       "question_latex": "<question number as a string>",
@@ -257,26 +328,30 @@ OUTPUT FORMAT — return ONLY the following JSON object:
       "total_marks": <integer>,
       "method_steps": [ {{ "type": "<mark type>", "description": "<description>" }} ],
       "official_marking_scheme_latex": "<full marking scheme answer in LaTeX>",
-      "diagram_urls": [], "needs_review": false
+      "diagram_urls": [], "needs_review": false,
+      "cognitive_demand": "<LOW | MEDIUM | HIGH>",
+      "difficulty_override": null
     }}
   ]
 }}
 CRITICAL RULES:
 1. ALWAYS extract ALL mark points from the marking scheme into "method_steps".
 2. Question number MUST include the top-level integer (e.g., "3(a)(i)").
+3. {difficulty_rule}
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
 
+    # ── QP prompt ─────────────────────────────────────────────────────────────
     return f"""
-You are an IGCSE/IB mathematics question extraction engine.
+You are an {board} mathematics question extraction engine.
 TARGET
-- You MUST read the ENTIRE document, not just the first page. Extract EVERY math question. Analyze the FIRST PAGE to extract metadata.
+- You MUST read the ENTIRE document. Extract EVERY math question.
 
 OUTPUT FORMAT — return ONLY the following JSON object:
 {{
   "metadata": {{
-    "curriculum": "<string>", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
+    "curriculum": "{board}", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
     "paperNumber": <integer, 0 if unknown>, "session": "<string or null>", "year": <integer, 0 if unknown>, "paper_reference_key": "<string>"
   }},
   "questions_array": [
@@ -285,27 +360,28 @@ OUTPUT FORMAT — return ONLY the following JSON object:
       "curriculum": "<same as metadata>", "program": "<same as metadata>", "subjectCode": "<same as metadata>", "tier": "<same as metadata>",
       "paperNumber": <same as metadata>, "session": "<same as metadata>", "year": <same as metadata>, "paper_reference_key": "<same as metadata>",
       "isTemplatizable": <true | false>, "variables": [],
-      "question_latex": "<full question text in LaTeX>",
+      "question_latex": "<full question text starting with question number>",
       "official_marking_scheme_latex": null,
       "diagram_urls": [],
-      "diagram_page_number": <integer, the actual page number (1-indexed) where the diagram is located. 0 if none>,
-      "diagram_y_range": [<float, top Y percentage 0.0-1.0>, <float, bottom Y percentage 0.0-1.0>],
-      "needs_review": false
+      "diagram_page_number": <integer>,
+      "diagram_y_range": [<float>, <float>],
+      "needs_review": false,
+      "cognitive_demand": "<LOW | MEDIUM | HIGH>",
+      "difficulty_override": null
     }}
   ]
 }}
 CRITICAL RULES:
-1. HIERARCHICAL NUMBERING (MANDATORY): You MUST ALWAYS prepend the parent integer to EVERY sub-question. Example: If you see "(a)", you MUST output "4(a)", NEVER just "(a)". If the parent number is not visually next to it, you MUST LOOK BACKWARDS in your extraction history to find the most recent parent integer, or INFER it from the document sequence. Missing the parent integer is a critical failure.
-2. "diagram_urls": If a question contains a diagram, graph, or illustration, output ["[NEEDS_CROP]"].
-3. DIAGRAM OWNERSHIP AND ORPHANS: If you see a diagram right before a sub-question like "(a)", it belongs to that current parent question. Place ["[NEEDS_CROP]"] ONLY in the JSON object for the first sub-part (e.g., "4(a)"). 
-4. "diagram_page_number": CRITICAL. If you output [NEEDS_CROP], provide the exact page number (1-indexed).
-5. "diagram_y_range" (ANTI-CROP OVERRIDE): CRITICAL. You MUST capture the ABSOLUTE FULL HEIGHT of the image. Identify the extreme topmost pixel and bottommost pixel. Then, intentionally EXPAND the box by adding at least 0.05 extra whitespace ABOVE and 0.05 extra whitespace BELOW. NEVER output tight bounding boxes. Example: If it sits between 0.30 and 0.50, output [0.25, 0.55]. Empty array [] if no diagram.
+1. HIERARCHICAL NUMBERING (MANDATORY): Prepend the parent integer to EVERY sub-question. Example: If you see "(a)", you MUST output "4(a)".
+2. INFERRED NUMBERING & SEQUENCE (CRITICAL): If a question does not have a visible number, you MUST infer its identity from the sequence.
+3. "diagram_urls": If a question contains a diagram, output ["[NEEDS_CROP]"].
+4. DIAGRAM OWNERSHIP: If a diagram appears before sub-parts (a), (b), attach it ONLY to the first sub-part (e.g., "4(a)").
+5. "diagram_y_range": Intentionally EXPAND the crop box by adding 0.05 extra whitespace ABOVE and BELOW the extreme pixels.
 6. Duplicate ALL metadata fields inside EVERY question object.
+7. {difficulty_rule}
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
-
-
 # ---------------------------------------------------------------------------
 # Normalization / defensive mapping
 # ---------------------------------------------------------------------------
@@ -325,14 +401,21 @@ _METADATA_FIELD_ALIASES: dict[str, str] = {
 
 _QUESTION_DEFAULTS: dict = {
     "document_type": "Question Paper", "curriculum": "", "program": None, "subjectCode": "", "tier": None,
-    "paperNumber": 0, "session": None, "year": 0, "paper_reference_key": "", "ref_code_base": "", "ref_code_full": "",
+    "paperNumber": 0, "session": None, "year": 0, 
+    "paper_reference_key": "", "unified_paper_key": "", "canonical_question_id": "", "parent_canonical_id": "",
+    "question_number_metadata": QuestionNumberMetadata().model_dump(),
+    "validation_status": "pending", "validation_warnings": [],
+    "ref_code_base": "", "ref_code_full": "",
     "isTemplatizable": False, "variables": [], "question_latex": "", "question_id": "", "final_answer": "",
     "total_marks": 0, "method_steps": [], "official_marking_scheme_latex": None, "diagram_urls": [], "needs_review": False,
+    "cognitive_demand": "MEDIUM", "difficulty_override": None,
 }
 
 _METADATA_DEFAULTS: dict = {
     "curriculum": "", "program": None, "subjectCode": "", "tier": None, "paperNumber": 0, "session": None,
-    "year": 0, "paper_reference_key": "", "ref_code_base": "", "ref_code_full": "",
+    "year": 0, "paper_reference_key": "", "unified_paper_key": "",
+    "validation_status": "pending", "validation_warnings": [],
+    "ref_code_base": "", "ref_code_full": "",
 }
 
 
@@ -424,7 +507,7 @@ def _normalize_metadata(raw: dict | None, filename: str, board: str, generated_k
     return result
 
 
-def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) -> dict:
+def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str, question_normalizer: QuestionNumberNormalizer) -> dict:
     if not isinstance(raw, dict): return dict(_QUESTION_DEFAULTS)
 
     raw = _remap_keys(raw, _QUESTION_FIELD_ALIASES)
@@ -433,15 +516,30 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
     for k in result:
         if k in raw: result[k] = raw[k]
 
+    # Apply question number normalization
+    question_id_for_normalization = result.get("question_id") or result.get("question_latex") or ""
+    if question_id_for_normalization and fallback_metadata.get("paper_reference_key"):
+        normalized_data = question_normalizer.normalize(
+            raw_question_id=question_id_for_normalization,
+            paper_reference_key=fallback_metadata["paper_reference_key"]
+        )
+        result.update(normalized_data)
+        result["question_number_metadata"] = QuestionNumberMetadata(**normalized_data["question_number_metadata"]).model_dump()
+
     result["document_type"] = document_type
     result["tier"] = _normalize_tier(result.get("tier"))
 
-    for meta_key in ("curriculum", "program", "subjectCode", "tier", "paperNumber", "session", "year", "ref_code_base", "ref_code_full"):
+    for meta_key in (
+        "curriculum", "program", "subjectCode", "tier", "paperNumber", "session", "year",
+        "paper_reference_key", "unified_paper_key", "validation_status", "validation_warnings",
+        "ref_code_base", "ref_code_full"
+    ):
         if not result.get(meta_key) and fallback_metadata.get(meta_key):
             result[meta_key] = fallback_metadata[meta_key]
 
     if fallback_metadata.get("curriculum"):
         result["curriculum"] = fallback_metadata["curriculum"]
+    # paper_reference_key is now also populated by the normalizer, but keep fallback for safety
     if not result.get("paper_reference_key") and fallback_metadata.get("paper_reference_key"):
         result["paper_reference_key"] = fallback_metadata["paper_reference_key"]
 
@@ -478,6 +576,17 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str) 
     result["diagram_urls"] = valid_urls
     result["needs_review"] = _coerce_bool(result["needs_review"], False)
 
+    # Coerce cognitive_demand — guard against Gemini returning unexpected values
+    _VALID_DEMANDS = {"LOW", "MEDIUM", "HIGH"}
+    if str(result.get("cognitive_demand", "")).upper() not in _VALID_DEMANDS:
+        result["cognitive_demand"] = "MEDIUM"
+    else:
+        result["cognitive_demand"] = str(result["cognitive_demand"]).upper()
+
+    # difficulty_override is always null from Gemini; only humans set it via dashboard
+    if result.get("difficulty_override") not in {"Easy", "Medium", "Hard", None}:
+        result["difficulty_override"] = None
+
     if not result["diagram_urls"]:
         q_latex = (result.get("question_latex") or "").lower()
         if has_diagram_indicator or "diagram" in q_latex or "graph" in q_latex or "figure" in q_latex:
@@ -503,17 +612,39 @@ def _normalize_response(
     if extra_metadata:
         meta_raw.update(extra_metadata)
     meta_normalized = _normalize_metadata(meta_raw, filename, board, generated_paper_reference_key)
+    # Ensure unified_paper_key is propagated to metadata for validation
+    if not meta_normalized.get("unified_paper_key") and len(meta_normalized.get("paper_reference_key", "")) > 0:
+        # Assuming QuestionNumberNormalizer is available and can generate this from paper_reference_key
+        temp_normalizer = QuestionNumberNormalizer() 
+        meta_normalized["unified_paper_key"] = temp_normalizer._generate_unified_paper_key(
+            meta_normalized["paper_reference_key"]
+        )
 
     questions_raw = parsed.get("questions_array") or []
     if not isinstance(questions_raw, list): questions_raw = []
 
     questions: list[ExtractedQuestion] = []
+    qp_parent_ids = set()
+    ms_parent_ids = set()
+
+    # Instantiate normalizer once for all questions
+    question_normalizer = QuestionNumberNormalizer()
+
     for i, q in enumerate(questions_raw):
         try:
-            normalized = _normalize_question(q, meta_normalized, document_type)
+            # Pass the normalizer instance to _normalize_question
+            normalized = _normalize_question(q, meta_normalized, document_type, question_normalizer)
             schema_fields = set(ExtractedQuestion.model_fields.keys())
             filtered = {k: v for k, v in normalized.items() if k in schema_fields}
-            questions.append(ExtractedQuestion(**filtered))
+            question_obj = ExtractedQuestion(**filtered)
+            questions.append(question_obj)
+
+            # Collect parent IDs for validation
+            if question_obj.parent_canonical_id and question_obj.document_type == "Question Paper":
+                qp_parent_ids.add(question_obj.parent_canonical_id)
+            elif question_obj.parent_canonical_id and question_obj.document_type == "Marking Scheme":
+                ms_parent_ids.add(question_obj.parent_canonical_id)
+
         except Exception as exc:
             print(f"⚠️  [normalize] Skipping question {i} due to validation error: {exc}")
             try:
@@ -528,9 +659,48 @@ def _normalize_response(
             except Exception:
                 pass
 
+    # --- Internal Sequence Gap Check Validation ---
+    validation_status = "ok"
+    validation_warnings = []
+    recommendation = "proceed"
+
+    # Decide which IDs to check based on the current document (Safely handles one-by-one uploads)
+    parent_ids_to_check = qp_parent_ids if document_type == "Question Paper" else ms_parent_ids
+
+    if parent_ids_to_check:
+        # Convert IDs to integers for sequence checking (ignoring non-numeric parents like 'A1')
+        int_parents = [int(pid) for pid in parent_ids_to_check if str(pid).isdigit()]
+        
+        if int_parents:
+            int_parents.sort()
+            expected_sequence = set(range(min(int_parents), max(int_parents) + 1))
+            actual_sequence = set(int_parents)
+            missing_in_sequence = expected_sequence - actual_sequence
+            
+            if missing_in_sequence:
+                validation_status = "warning"
+                recommendation = "review"
+                validation_warnings.append(
+                    f"Sequence gap detected in {document_type}. Missing parent questions: "
+                    f"{', '.join(map(str, sorted(list(missing_in_sequence))))}"
+                )
+
+    # Update metadata strictly for fallback
+    meta_normalized["validation_status"] = validation_status
+    meta_normalized["validation_warnings"] = validation_warnings
+
+    # Create the exact Validation Report envelope Node.js expects
+    val_report = ValidationReport(
+        status=validation_status,
+        recommendation=recommendation,
+        message=" | ".join(validation_warnings) if validation_warnings else "Sequence is continuous.",
+        checks={"sequence_gaps": len(validation_warnings) > 0}
+    )
+
     return SlicedQuestionsResponse(
         metadata=ExtractedPaperMetadata(**meta_normalized),
         questions_array=questions,
+        validation_report=val_report
     )
 
 
@@ -727,6 +897,7 @@ def _extract_pdf_native_sync(
     extra_metadata = {}
     validation_result = {"match_status": True, "mismatches": []}
     paper_reference_key = ""
+    question_normalizer = QuestionNumberNormalizer()
 
     try:
         client = _get_client()
