@@ -230,6 +230,21 @@ STRICT LATEX ESCAPING (MANDATORY)
 - Extract ALL math as raw LaTeX. Use $...$ for inline and $$...$$ for block.
 - NEVER use Unicode math characters (², ³, ±, α, ∫). Use LaTeX equivalents (^2, ^3, \\pm, \\alpha, \\int).
 - Double-escape every backslash for JSON: write \\\\frac{}{}, NOT \\frac{}{}.
+
+ANSWER SPACES — IGNORE COMPLETELY (MANDATORY)
+- Exam papers contain answer-writing areas: dotted lines (......), ruled lines (______),
+  blank boxes, or "[2]"-style mark brackets at line ends.
+- These are NOT question content. DO NOT extract them. DO NOT convert them to \\textunderscore,
+  \\underline, \\dotfill, or any LaTeX equivalent. Omit them entirely from question_latex.
+- If you see a sequence of \\textunderscore or \\ldots representing a blank line, DELETE it.
+
+PARENT CONTEXT — MANDATORY FOR MULTI-PAGE PDFs
+- If a question has sub-parts (a), (b), (c) on a DIFFERENT page than the parent stem,
+  you MUST still copy the full parent stem text into EVERY sub-part's question_latex.
+- NEVER output just "(a) ..." without the parent question number and stem prepended.
+- Example: Parent "3 The diagram shows a triangle." on page 2, sub-parts on page 3:
+  → question_latex for 3(a): "3(a) [full parent stem text] [sub-part text]"
+  → question_latex for 3(b): "3(b) [full parent stem text] [sub-part text]"
 """.strip()
 
     prk_instruction = (
@@ -384,6 +399,26 @@ CRITICAL RULES:
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
+def _sanitize_answer_blanks(text: str) -> str:
+    """
+    Remove answer-blank artifacts that Gemini sometimes outputs despite prompt instructions.
+    Covers: repeated \\textunderscore, \\ldots chains, \\underline{\\hspace{...}}, dotfill, etc.
+    """
+    if not text:
+        return text
+    # Remove runs of \textunderscore (2+ consecutive)
+    text = re.sub(r'(\\textunderscore){2,}', '', text)
+    # Remove \underline{\hspace{...}} — blank line placeholders
+    text = re.sub(r'\\underline\{\\hspace\{[^}]*\}\}', '', text)
+    # Remove \dotfill
+    text = re.sub(r'\\dotfill', '', text)
+    # Remove mark-bracket suffixes like [2] or [1] at end of lines
+    text = re.sub(r'\s*\[\d+\]\s*$', '', text, flags=re.MULTILINE)
+    # Collapse multiple blank lines into one
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 # ---------------------------------------------------------------------------
 # Normalization / defensive mapping
 # ---------------------------------------------------------------------------
@@ -597,7 +632,7 @@ def _normalize_question(raw: dict, fallback_metadata: dict, document_type: str, 
     if not isinstance(result["diagram_urls"], list): result["diagram_urls"] = []
     result["curriculum"] = result["curriculum"] or ""
     result["subjectCode"] = result["subjectCode"] or ""
-    result["question_latex"] = result["question_latex"] or ""
+    result["question_latex"] = _sanitize_answer_blanks(result.get("question_latex") or "")
 
     return result
 
@@ -784,7 +819,7 @@ def _wait_for_file_ready(client: genai.Client, file_name: str, timeout_seconds: 
         last_state = _normalize_state(getattr(remote_file, "state", None))
         if "ACTIVE" in last_state: return remote_file
         if "FAILED" in last_state: raise RuntimeError(f"Uploaded file entered FAILED state: {last_state}")
-        time.sleep(1.5)
+        time.sleep(1.0)
     raise TimeoutError(f"File not ACTIVE before timeout. Last state: {last_state}")
 
 
@@ -944,7 +979,7 @@ def _extract_pdf_native_sync(
         uploaded_file = client.files.upload(file=temp_file_path)
         _wait_for_file_ready(client, uploaded_file.name, timeout_seconds=240)
 
-        system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key)
+        system_prompt = _build_pdf_system_prompt(document_type, paper_reference_key, board)
 
         # ── Model selection & generation ─────────────────────────────────────
         # Loops through ALL models in priority order before raising.
@@ -958,7 +993,12 @@ def _extract_pdf_native_sync(
                     client,
                     model=model_name,  
                     contents=[system_prompt, uploaded_file],
-                    config={"response_mime_type": "application/json"},
+                    config={
+                        "response_mime_type": "application/json",
+                        # Disable extended thinking — not needed for structured extraction.
+                        # Cuts latency significantly on gemini-2.5-flash.
+                        "thinking_config": {"thinking_budget": 0},
+                    },
                     retries=3,
                     delay=5.0,
                 )
