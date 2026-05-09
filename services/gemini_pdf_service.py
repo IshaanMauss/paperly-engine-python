@@ -280,26 +280,39 @@ Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override"
 
     elif board_upper in ("IGCSE", "CAMBRIDGE"):
         difficulty_rule = """
-DIFFICULTY & COGNITIVE DEMAND (IGCSE — MARK-DRIVEN):
-Mark count is PRIMARY. Command term is secondary confirmation.
+DIFFICULTY & COGNITIVE DEMAND (IGCSE UNIVERSAL — OFFICIAL COMMAND WORDS):
+Mark count is PRIMARY. Command word is secondary confirmation.
+Use the OFFICIAL Cambridge command word definitions and math patterns below.
 
-  LOW   (1 mark):
-        State, Write down, Name, Identify, List, Label, Recall,
-        "Write down the mathematical name of".
+  LOW  (1 mark  OR  these command words regardless of marks):
+       State      — express in clear terms
+       Write down — answer without significant working
+       Give       — answer from recall or given source
+       Write      — answer in a specific form
+       Plot       — mark points on a graph
+       Name, Identify, List, Label, Recall
 
-  MEDIUM (2 marks):
-        Work out, Find, Calculate, Expand, Factorise, Simplify, Solve,
-        Describe, Construct, Complete, Measure, "Give your answer in",
-        "Show your working".
+  MEDIUM (2 marks  OR  these command words):
+       Work out   — calculate with or without a calculator
+       Calculate  — work out from given facts or information
+       Describe   — state characteristics and main features
+       Sketch     — freehand drawing showing key features
+       Determine  — establish with certainty (single-step)
+       Construct, Complete, Measure, Outline, Suggest
+       CORE MATH  — Solve, Expand, Factorise, Simplify
 
-  HIGH  (3+ marks  OR  any of these command patterns regardless of marks):
-        "Make [variable] the subject of",
-        "Show that", "Prove that",
-        "Draw a [histogram / graph / cumulative frequency curve / sketch]",
-        "Find [expression] in terms of [variable]",
-        "Find the average [speed / rate / density]",
-        "Hence show", "Hence or otherwise",
-        Derive, Analyse, Evaluate, Discuss, Justify.
+  HIGH (3+ marks  OR  any of these command patterns regardless of marks):
+       Show (that) — structured evidence leading to a given result
+       Explain     — set out reasons / say why or how
+       Comment     — give an informed opinion
+       Compare     — identify similarities and/or differences
+       Revise      — change to reflect further information
+       "Make [variable] the subject of"
+       "Find [expression] in terms of [variable]"
+       "Draw a [histogram / graph / cumulative frequency curve]"
+       "Find the average [speed / rate / density]"
+       "Hence show", "Hence or otherwise"
+       Derive, Justify, Prove, Analyse
 
 Return exactly one of: "LOW", "MEDIUM", "HIGH". Always set "difficulty_override" to null.
 """.strip()
