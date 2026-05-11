@@ -1,6 +1,6 @@
 # File: schemas/ingestion_schema.py
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any
+from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +95,9 @@ class ExtractedQuestion(BaseModel):
             "'HIGH' (Evaluate, Analyse, 4+ marks). Set by Gemini; never modified by the pipeline."
         ),
     )
-    difficulty_override: Optional[str] = Field(
-        None,
-        description=(
-            "Manual difficulty rating set by a human reviewer on the dashboard. "
-            "Values: 'Easy', 'Medium', 'Hard', or null (no override). "
-            "Dashboard filter resolves as: difficulty_override ?? cognitive_demand."
-        ),
-    )
+    difficulty_override: Optional[str] = Field(default=None)
+    diagram_page_number: Optional[int] = Field(default=None)
+    diagram_y_range: Optional[List[float]] = Field(default_factory=list)
 
     # ── MS Training Schema fields ─────────────────────────────────────────────
     question_id: Optional[str] = Field(

@@ -356,7 +356,10 @@ OUTPUT FORMAT — return ONLY the following JSON object:
       "total_marks": <integer>,
       "method_steps": [ {{ "type": "<mark type>", "description": "<description>" }} ],
       "official_marking_scheme_latex": "<full marking scheme answer in LaTeX>",
-      "diagram_urls": [], "needs_review": false,
+      "diagram_urls": [],
+      "diagram_page_number": <integer or null>,
+      "diagram_y_range": [<float>, <float>],
+      "needs_review": false,
       "cognitive_demand": "<LOW | MEDIUM | HIGH>",
       "difficulty_override": null
     }}
@@ -365,7 +368,11 @@ OUTPUT FORMAT — return ONLY the following JSON object:
 CRITICAL RULES:
 1. ALWAYS extract ALL mark points from the marking scheme into "method_steps".
 2. Question number MUST include the top-level integer (e.g., "3(a)(i)").
-3. {difficulty_rule}
+3. STRICT DIAGRAM DETECTION ("diagram_urls"): ONLY output ["[NEEDS_CROP]"] if you physically see an ACTUAL visual element in the marking scheme.
+   ✅ ALLOWED: Official MS graphs, geometry diagrams, number lines, coordinate axes, drawn figures.
+   ❌ FORBIDDEN: NEVER trigger for blank answer lines, worked-text-only answers, or just because a QP had a diagram.
+4. "diagram_y_range": If a diagram is detected, the bounding box MUST strictly wrap it. EXPAND by adding 0.05 whitespace ABOVE and BELOW the extreme pixels.
+5. {difficulty_rule}
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
