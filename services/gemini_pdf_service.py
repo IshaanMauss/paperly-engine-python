@@ -168,6 +168,10 @@ def _verify_igcse_metadata_from_text(text: str, paper_reference_key: str) -> dic
 # ---------------------------------------------------------------------------
 
 def _extract_ib_metadata_from_page(page_base64: str) -> dict:
+    uploaded_file = None
+    temp_file_path = None
+    client = None
+    
     try:
         client = _get_client()
         model = _pick_available_model(client)
@@ -199,25 +203,30 @@ CRITICAL RULES:
 3. Set field to null if you cannot find it with certainty.
 4. DO NOT invent or assume any value.
 """
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=[system_prompt, uploaded_file],
-                config={"response_mime_type": "application/json"},
-            )
-            raw_text = getattr(response, "text", "") or ""
-            parsed = _parse_json_payload(raw_text)
+        response = client.models.generate_content(
+            model=model,
+            contents=[system_prompt, uploaded_file],
+            config={"response_mime_type": "application/json"},
+        )
+        raw_text = getattr(response, "text", "") or ""
+        parsed = _parse_json_payload(raw_text)
+        return parsed
 
-            client.files.delete(name=uploaded_file.name)
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            return parsed
-        except Exception as e:
-            print(f"⚠️  [IB Metadata Extraction] Failed: {str(e)}")
-            return None
     except Exception as e:
         print(f"❌ [IB Metadata Extraction Error] {type(e).__name__}: {e!r}")
         return None
+        
+    finally:
+        if client and uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +428,8 @@ CRITICAL RULES:
 {prk_instruction}
 {LATEX_RULES}
 """.strip()
+
+
 def _sanitize_answer_blanks(text: str) -> str:
     """
     Remove answer-blank artifacts that Gemini sometimes outputs despite prompt instructions.
@@ -670,10 +681,11 @@ def _normalize_response(
         meta_raw.update(extra_metadata)
     meta_normalized = _normalize_metadata(meta_raw, filename, board, generated_paper_reference_key)
     # Ensure unified_paper_key is propagated to metadata for validation
-    if not meta_normalized.get("unified_paper_key") and len(meta_normalized.get("paper_reference_key", "")) > 0:
-        # Assuming QuestionNumberNormalizer is available and can generate this from paper_reference_key
-        temp_normalizer = QuestionNumberNormalizer() 
-        meta_normalized["unified_paper_key"] = temp_normalizer._generate_unified_paper_key(
+    # Instantiate normalizer once at the top
+    question_normalizer = QuestionNumberNormalizer()
+
+    if not meta_normalized.get("unified_paper_key") and meta_normalized.get("paper_reference_key"):
+        meta_normalized["unified_paper_key"] = question_normalizer._generate_unified_paper_key(
             meta_normalized["paper_reference_key"]
         )
 
@@ -683,9 +695,6 @@ def _normalize_response(
     questions: list[ExtractedQuestion] = []
     qp_parent_ids = set()
     ms_parent_ids = set()
-
-    # Instantiate normalizer once for all questions
-    question_normalizer = QuestionNumberNormalizer()
 
     for i, q in enumerate(questions_raw):
         try:
@@ -872,7 +881,7 @@ def _generate_with_retry(
                 for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
             )
             if is_transient and attempt < retries - 1:
-                wait = delay * (attempt + 1)   # 5s → 10s → 15s
+                wait = delay * (2 ** attempt)
                 print(
                     f"⚠️  [Gemini] Transient error on attempt {attempt + 1}/{retries}, "
                     f"retrying in {wait:.0f}s… ({e})"
@@ -954,7 +963,6 @@ def _extract_pdf_native_sync(
     extra_metadata = {}
     validation_result = {"match_status": True, "mismatches": []}
     paper_reference_key = ""
-    question_normalizer = QuestionNumberNormalizer()
 
     try:
         client = _get_client()
@@ -980,7 +988,13 @@ def _extract_pdf_native_sync(
                     if len(prefix) == 4:
                         year = "20" + prefix[:2]
                         sess_digits = prefix[2:]
-                        session = "may" if sess_digits == "25" else "november"
+                        if sess_digits == "25":
+                            session = "may"
+                        elif sess_digits in ["11", "00"]:
+                            session = "november"
+                        else:
+                            session = "november"
+                            print(f"⚠️ [IB Extraction] Unrecognized session digits \'{sess_digits}\'. Defaulting to \'november\'.")
                 paper_reference_key = build_paper_reference_key(
                     curriculum="ib", subject=ib_metadata.get("subject_name", ""),
                     tier=ib_metadata.get("level", ""), session=session, year=year,
