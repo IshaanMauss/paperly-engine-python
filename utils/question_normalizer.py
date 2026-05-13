@@ -2,7 +2,29 @@ import re
 
 class QuestionNumberNormalizer:
     def __init__(self):
-        pass
+        # 🚀 THE FINAL BULLETPROOF REGEX (Handles all spaces, brackets, and word bleeds)
+        self._DEPTH3_REGEX = re.compile(
+            r"^(\d+)"                                         # Group 1: Parent
+            r"(?:"
+                r"\s*[\.\(\)]*\s*"                            # Separator 1: Handles "9(a)", "9 (a)", "9.a" flawlessly
+                # Group 2: Safe letters. Negative lookahead prevents standalone i,v,x consumption.
+                r"([a-hj-uw-zA-HJ-UW-Z]|(?![ivxIVX](?:[\.\(\)\s]|$))[a-zA-Z])" 
+                r"(?![a-zA-Z])"                               # 🔒 LOCK 1: Prevents "6 Solve" from bleeding into "6.s"
+                r"(?:"
+                    r"\s*[\.\(\)]*\s*"                        # Separator 2: Handles "(b)(i)", "(b) (i)", "b.i"
+                    # Group 3: Roman numerals ordered longest to shortest
+                    r"(viii|vii|vi|iv|ix|iii|ii|i|x|v)"
+                    r"(?![a-zA-Z])"                           # 🔒 LOCK 2: Prevents word bleed on roman numerals
+                r")?"
+            r")?",
+            re.IGNORECASE,
+        )
+
+        # Fallback regex for orphaned subparts
+        self._ORPHAN_REGEX = re.compile(
+            r"^\s*[\(\[]?\s*([a-z]|viii|vii|vi|iv|ix|iii|ii|i|x|v)\s*[\)\]\.]",
+            re.IGNORECASE,
+        )
 
     def normalize(self, raw_question_id: str, paper_reference_key: str) -> dict:
         """
@@ -30,45 +52,31 @@ class QuestionNumberNormalizer:
         }
 
     def _extract_parts(self, raw_id: str) -> list[str]:
-        # 1. Clean basic noise like leading 'Q'
+        """
+        Parse a raw question label into a list of hierarchical parts.
+        Returns up to 3 elements: [parent_digit, letter_subpart, roman_subpart]
+        """
+        # 1. Strip leading 'Q' or 'q' noise
         cleaned = re.sub(r'^[Qq]\s*', '', str(raw_id).strip())
-        
-        # 2. ULTIMATE STRICT REGEX: Captures exactly Parent, Subpart 1, Subpart 2
-        # It strictly avoids trailing texts like " a square number" by explicitly 
-        # looking for boundaries and restricting groups.
-        regex = re.compile(
-            r"^(\d+)"                                         # Group 1: Parent (e.g., 4)
-            r"(?:"
-                r"[\.\(\)]*"                                  # Optional separators like '(' or '.'
-                r"\s*"
-                r"([a-z])"                                    # Group 2: Single letter (e.g., a)
-                r"[\.\(\)]*"                                  # Optional closing separators like ')'
-                r"(?:"
-                    r"[\.\(\)]*"
-                    r"\s*"
-                    r"(i{1,3}|iv|v|vi{1,3}|ix|x)"             # Group 3: Roman numeral (e.g., iii)
-                    r"[\.\(\)]*"
-                r")?"
-            r")?",
-            re.IGNORECASE
-        )
-        
-        match = regex.match(cleaned)
-        
-        parts = []
-        if match and match.group(1):
-            parts.append(match.group(1))                         # Append Parent
-            if match.group(2):
-                parts.append(match.group(2).lower())             # Append 'a', 'b', etc.
-            if match.group(3):
-                parts.append(match.group(3).lower())             # Append 'i', 'ii', etc.
-            return parts
-        
-        # 3. Fallback for orphaned subparts like "(a)" or "ii)"
-        sub_match = re.match(r'^\s*[\(\[]?([a-z]|[ivx]+)[\)\]\.]', cleaned, re.IGNORECASE)
-        if sub_match:
-            return [sub_match.group(1).lower()]
 
+        # 2. Primary match via the strict 3-group regex.
+        match = self._DEPTH3_REGEX.match(cleaned)
+
+        parts: list[str] = []
+        if match and match.group(1):
+            parts.append(match.group(1))                  # Parent digit(s)
+            if match.group(2):
+                parts.append(match.group(2).lower())      # Letter subpart
+            if match.group(3):
+                parts.append(match.group(3).lower())      # Roman numeral subpart
+            return parts
+
+        # 3. Fallback for orphaned subparts (no parent digit)
+        orphan = self._ORPHAN_REGEX.match(cleaned)
+        if orphan:
+            return [orphan.group(1).lower()]
+
+        # 4. Completely unparseable
         return []
 
     def _generate_unified_paper_key(self, paper_reference_key: str) -> str:

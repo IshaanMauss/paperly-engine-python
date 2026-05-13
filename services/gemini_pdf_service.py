@@ -17,26 +17,59 @@ from utils.question_normalizer import QuestionNumberNormalizer
 
 
 # ---------------------------------------------------------------------------
+# BUG 1 FIX — Pre-processing Sanitization Pipeline
+# Converts a raw, noisy filename into a clean, regex-parseable string BEFORE
+# any key-generation regex runs. Mirrors JS _sanitizeFileNameForParsing exactly.
+#
+# Transformation example:
+#   "0580_s18_ms_4 (Extended)2 (1).pdf"
+#   step 1 → lowercase           → "0580_s18_ms_4 (extended)2 (1).pdf"
+#   step 2 → strip tier tags     → "0580_s18_ms_42 (1).pdf"
+#   step 3 → strip dupe markers  → "0580_s18_ms_42 .pdf"
+#   step 4 → collapse whitespace → "0580_s18_ms_42.pdf"
+#
+# Steps are strictly ordered: tier tags must be stripped before dupe markers so
+# "(Extended)1" doesn't leave an orphaned "(1)" for step 3 to skip.
+# ---------------------------------------------------------------------------
+def _sanitize_filename_for_parsing(raw: str) -> str:
+    s = raw.lower()
+    # Step 1: Strip syllabus tier tags with any surrounding whitespace.
+    s = re.sub(r'\s*\((extended|core|higher|foundation)\)\s*', '', s, flags=re.IGNORECASE)
+    # Step 2: Strip OS-generated duplicate markers: (1), (2), (3) …
+    s = re.sub(r'\s*\(\d+\)\s*', '', s)
+    # Step 3: Collapse all remaining whitespace (rogue spaces between digits, etc.)
+    s = re.sub(r'\s+', '', s)
+    return s
+
+
+# ---------------------------------------------------------------------------
 # paper_reference_key generator - IGCSE
 # ---------------------------------------------------------------------------
 
 def _generate_igcse_paper_reference_key(filename: str) -> str:
     """
     Derive a canonical slug from the IGCSE filename.
+
+    Applies a sanitization pipeline before regex matching to handle noisy
+    real-world filenames like '0580_s18_ms_4 (Extended)2 (1).pdf'.
     """
     if not filename:
         return ""
 
+    # ── PRE-PROCESSING: sanitize before any regex touch (BUG 1 FIX) ─────────
+    clean = _sanitize_filename_for_parsing(filename)
+    # ─────────────────────────────────────────────────────────────────────────
+
     match = re.search(
-        r"(\d{4})_([smwSMW])(\d{2})_((?:ms|qp|er|gt))_(\d)(\d)",
-        filename,
+        r"(\d{4})_([smw])(\d{2})_((?:ms|qp|er|gt))_(\d)(\d)",
+        clean,
         re.IGNORECASE,
     )
     if match:
         subject_code, season, year_suffix, doc_type, paper_number, variant = match.groups()
         return f"igcse_{subject_code}_{season.lower()}{year_suffix}_{doc_type.lower()}_{paper_number}{variant}"
 
-    match2 = re.search(r"(\d{4})_([smwSMW])(\d{2})", filename, re.IGNORECASE)
+    match2 = re.search(r"(\d{4})_([smw])(\d{2})", clean, re.IGNORECASE)
     if match2:
         subject_code, season, year_suffix = match2.groups()
         return f"igcse_{subject_code}_{season.lower()}{year_suffix}"
@@ -567,6 +600,23 @@ def _normalize_metadata(raw: dict | None, filename: str, board: str, generated_k
     generated_key = ""
     if board.upper() == "IGCSE":
         generated_key = _generate_igcse_paper_reference_key(filename)
+        
+        # 🚀 SMART SEASON AUTO-CORRECTION: Override filename IF AND ONLY IF AI found the real session
+        extracted_session = str(result.get("session", "")).lower().strip()
+        if generated_key and extracted_session:
+            real_season = None
+            if any(x in extracted_session for x in ["mar", "feb"]): real_season = "m"
+            elif any(x in extracted_session for x in ["may", "jun", "sum"]): real_season = "s"
+            elif any(x in extracted_session for x in ["oct", "nov", "win"]): real_season = "w"
+            
+            if real_season:
+                # Sniper Regex: Only targets the session character between subject code and year
+                generated_key = re.sub(
+                    r'^(igcse_\d{4}_)[smw](\d{2})', 
+                    fr'\g<1>{real_season}\g<2>', 
+                    generated_key,
+                    flags=re.IGNORECASE
+                )
     else:
         generated_key = generated_key_override or result.get("paper_reference_key", "")
 
