@@ -448,6 +448,9 @@ Rules:
 - question_number must identify the question this diagram belongs to (e.g. "4", "4a", "3(b)(ii)").
 """.strip()
 
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, RateLimitError
+
+_VISION_SEMAPHORE = asyncio.Semaphore(3)
 _VISION_MODEL = "gemini-2.5-flash"  # Upgraded model for better bounding box identification.
 
 
@@ -476,12 +479,31 @@ async def _run_vision_engine_for_page(
             }
         }
 
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=_VISION_MODEL,
-            contents=[_VISION_ENGINE_PROMPT, image_content],
-            config={"response_mime_type": "application/json"},
-        )
+        response = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                async with _VISION_SEMAPHORE:
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model=_VISION_MODEL,
+                        contents=[_VISION_ENGINE_PROMPT, image_content],
+                        config={"response_mime_type": "application/json"},
+                    )
+                break
+            except (ResourceExhausted, ServiceUnavailable, RateLimitError) as e:
+                last_exc = e
+                wait_time = 2 ** attempt
+                logger.warning(f"[Vision Engine] Rate limit or transient error on page {page_num}, attempt {attempt + 1}/3. Retrying in {wait_time}s. Error: {e}")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                last_exc = e
+                logger.error(f"[Vision Engine] Unexpected error on page {page_num}: {e}")
+                raise # Re-raise unexpected errors immediately
+
+        if response is None:
+            logger.error(f"[Vision Engine] All retries failed for page {page_num}. Last error: {last_exc}")
+            return []
 
         raw_text = (getattr(response, "text", "") or "").strip()
         logger.debug(f"[Vision Engine] Page {page_num} raw Gemini response: {raw_text[:1000]}...")
@@ -555,18 +577,19 @@ async def _run_vision_engine_for_page(
 def _build_vision_lookup(
     all_page_results: List[List[Dict]],
     question_normalizer: QuestionNumberNormalizer, # Pass normalizer instance
-) -> Dict[str, Dict]:
+) -> Dict[str, List[Dict]]:
     """
     Flatten per-page Vision Engine results into a single lookup dict keyed by
-    normalised question number.  Later entries for the same question overwrite
-    earlier ones (which is fine — the Vision Engine uses page context).
+    normalised question number.  Ensures all diagrams for a question are captured.
     """
-    lookup: Dict[str, Dict] = {}
+    lookup: Dict[str, List[Dict]] = {}
     for page_results in all_page_results:
         for coord in page_results:
             key = question_normalizer.normalize_for_matching(coord.get("question_number", ""))
             if key:
-                lookup[key] = coord
+                if key not in lookup:
+                    lookup[key] = []
+                lookup[key].append(coord)
     return lookup
 
 
@@ -576,7 +599,7 @@ def _build_vision_lookup(
 
 async def _apply_vision_crops_to_questions(
     questions_raw: List[dict],
-    vision_lookup: Dict[str, Dict],
+    vision_lookup: Dict[str, List[Dict]],
     pdf_base64: str,
     question_normalizer: QuestionNumberNormalizer, # Pass normalizer instance
 ) -> List[dict]:
@@ -590,70 +613,90 @@ async def _apply_vision_crops_to_questions(
     if not vision_lookup or not questions_raw:
         return questions_raw
 
-    async def _maybe_crop(q: dict) -> dict:
-        # Determine the question identifier to look up
+    async def _process_question_crops(q: dict) -> dict:
         q_id_candidates = [
             q.get("canonical_question_id", ""),
             q.get("question_id", ""),
             q.get("question_latex", ""),
         ]
-        match_coord = None
-        for candidate in q_id_candidates:
-            key = question_normalizer.normalize_for_matching(candidate)
-            if key and key in vision_lookup:
-                match_coord = vision_lookup[key]
-                break
+        
+        # Initialize diagram_urls as a list if it doesn't exist or is not a list
+        if not isinstance(q.get("diagram_urls"), list):
+            q["diagram_urls"] = []
 
-        if match_coord is None:
-            # No Vision Engine coordinate found — keep existing diagram_urls
-            logger.debug(f"[Vision Merge] ⚪ No vision coordinate found for q={q.get("question_id", "?")}")
-            return q
-
-        # Vision Engine found a coordinate for this question
-        # Mark this coordinate as "used" to track unmatched ones later
-        match_coord["__used__"] = True
-
-        existing_urls = q.get("diagram_urls") or []
+        existing_urls = q["diagram_urls"]
         already_has_real_image = any(
             isinstance(u, str) and (u.startswith("http") or u.startswith("data:image"))
             for u in existing_urls
         )
+
         if already_has_real_image:
             # Task A already produced a real crop — Vision Engine is backup, skip.
+            logger.debug(f"[Vision Merge] ⚪ Task A already has real images for q={q.get("question_id", "?")}. Skipping Vision Engine crops.")
             return q
 
-        # Perform the guaranteed crop
-        page_num   = match_coord.get("page_num", 0)
-        y_start    = match_coord["y_start_pct"]
-        y_end      = match_coord["y_end_pct"]
+        # Collect all coordinates for this question
+        coords_to_crop = []
+        for candidate in q_id_candidates:
+            key = question_normalizer.normalize_for_matching(candidate)
+            if key and key in vision_lookup:
+                coords_to_crop.extend(vision_lookup[key])
+                # Mark all coordinates for this key as "used"
+                for coord in vision_lookup[key]:
+                    coord["__used__"] = True
+                # Clear the entry in vision_lookup after processing to prevent reprocessing
+                vision_lookup[key] = [] 
 
-        cropped_b64 = await crop_and_compress_diagram_async(
-            pdf_base64=pdf_base64,
-            page_num=page_num,
-            y_start_pct=y_start,
-            y_end_pct=y_end,
-        )
+        if not coords_to_crop:
+            logger.debug(f"[Vision Merge] ⚪ No vision coordinates found for q={q.get("question_id", "?")}")
+            return q
 
-        if cropped_b64:
-            q["diagram_urls"] = [f"data:image/jpeg;base64,{cropped_b64}"]
-            logger.info(
-                f"[Vision Merge] ✅ Diagram cropped for q={q.get('question_id', '?')} "
-                f"(page={page_num}, y={y_start:.1f}%–{y_end:.1f}%)"
+        # Perform crops for all found coordinates concurrently
+        crop_tasks = []
+        for coord in coords_to_crop:
+            page_num = coord.get("page_num", 0)
+            y_start  = coord["y_start_pct"]
+            y_end    = coord["y_end_pct"]
+            crop_tasks.append(
+                crop_and_compress_diagram_async(
+                    pdf_base64=pdf_base64,
+                    page_num=page_num,
+                    y_start_pct=y_start,
+                    y_end_pct=y_end,
+                )
             )
-        else:
-            logger.warning(
-                f"[Vision Merge] ⚠️ Crop returned None for q={q.get('question_id', '?')}"
-            )
+        
+        cropped_b64_list = await asyncio.gather(*crop_tasks)
 
+        for i, cropped_b64 in enumerate(cropped_b64_list):
+            if cropped_b64:
+                existing_urls.append(f"data:image/jpeg;base64,{cropped_b64}")
+                coord = coords_to_crop[i] # Get the original coordinate for logging
+                logger.info(
+                    f"[Vision Merge] ✅ Diagram cropped for q={q.get("question_id", "?")} "
+                    f"(page={coord.get("page_num", "?")}, y={coord["y_start_pct"]:.1f}%–{coord["y_end_pct"]:.1f}%)"
+                )
+            else:
+                coord = coords_to_crop[i]
+                logger.warning(
+                    f"[Vision Merge] ⚠️ Crop returned None for q={q.get("question_id", "?")} "
+                    f"(page={coord.get("page_num", "?")}, y={coord["y_start_pct"]:.1f}%–{coord["y_end_pct"]:.1f}%)"
+                )
+
+        q["diagram_urls"] = existing_urls
         return q
 
-    # Run all crops concurrently
-    updated = await asyncio.gather(*[_maybe_crop(q) for q in questions_raw])
+    # Run all question processing tasks concurrently
+    updated = await asyncio.gather(*[_process_question_crops(q) for q in questions_raw])
 
     # Log warnings for any vision coordinates that were NOT matched to a Task A question
-    unmatched_coords = [
-        coord for coord in vision_lookup.values() if not coord.get("__used__", False)
-    ]
+    # We need to re-iterate through the values as the vision_lookup was modified
+    unmatched_coords = []
+    for coords_list in vision_lookup.values():
+        for coord in coords_list:
+            if not coord.get("__used__", False):
+                unmatched_coords.append(coord)
+
     for coord in unmatched_coords:
         logger.warning(
             f"[Vision Merge] ⚠️ Vision coordinate for q={coord.get("question_number", "?")} "
