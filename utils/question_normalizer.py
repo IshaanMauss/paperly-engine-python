@@ -79,6 +79,31 @@ class QuestionNumberNormalizer:
         # 4. Completely unparseable
         return []
 
+    def normalize_for_matching(self, raw: str) -> str:
+        """
+        Normalise a question identifier for fuzzy cross-engine matching.
+        "4(a)(i)"  → "4ai"
+        "4.a.i"    → "4ai"
+        "4 a i"    → "4ai"
+        """
+        if not raw:
+            return ""
+        s = str(raw).lower()
+        # Remove all punctuation, whitespace, and normalize common variations
+        s = re.sub(r"\s*\([a-z0-9]+\)", "", s) # Remove (a), (i) etc. but keep the content inside for now
+        s = re.sub(r"[^a-z0-9]", "", s) # Remove all non-alphanumeric
+
+        # Handle cases like "4ai" from "4(a)(i)" or "4.a.i"
+        # This regex specifically targets patterns like 4a, 4ai, 4aii etc.
+        # It's aggressive to ensure matching, e.g., "4 (a) (i)" -> "4ai"
+        match = re.match(r"^(\d+)([a-z]*)(i|ii|iii|iv|v|vi|vii|viii|ix|x)?", s)
+        if match:
+            parts = [match.group(1)]
+            if match.group(2): parts.append(match.group(2))
+            if match.group(3): parts.append(match.group(3))
+            return "".join(parts)
+        return s
+
     def _generate_unified_paper_key(self, paper_reference_key: str) -> str:
         # Input: "igcse_0607_m23_qp_22" -> Output: "igcse_0607_m23_22"
         # Strict removal of doc_type markers to unify QP and MS
