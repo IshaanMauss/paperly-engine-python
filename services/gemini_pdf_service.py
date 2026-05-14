@@ -448,7 +448,7 @@ Rules:
 - question_number must identify the question this diagram belongs to (e.g. "4", "4a", "3(b)(ii)").
 """.strip()
 
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, RateLimitError
+
 
 _VISION_SEMAPHORE = asyncio.Semaphore(3)
 _VISION_MODEL = "gemini-2.5-flash"  # Upgraded model for better bounding box identification.
@@ -491,15 +491,17 @@ async def _run_vision_engine_for_page(
                         config={"response_mime_type": "application/json"},
                     )
                 break
-            except (ResourceExhausted, ServiceUnavailable, RateLimitError) as e:
-                last_exc = e
-                wait_time = 2 ** attempt
-                logger.warning(f"[Vision Engine] Rate limit or transient error on page {page_num}, attempt {attempt + 1}/3. Retrying in {wait_time}s. Error: {e}")
-                await asyncio.sleep(wait_time)
             except Exception as e:
                 last_exc = e
-                logger.error(f"[Vision Engine] Unexpected error on page {page_num}: {e}")
-                raise # Re-raise unexpected errors immediately
+                err_str = str(e)
+                is_transient = any(code in err_str for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "Too Many Requests"))
+                if is_transient and attempt < 2:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"[Vision Engine] Rate limit or transient error on page {page_num}, attempt {attempt + 1}/3. Retrying in {wait_time}s. Error: {e}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"[Vision Engine] Non-transient or all retries failed for page {page_num}: {e}")
+                    raise # Re-raise immediately if not transient or no retries left
 
         if response is None:
             logger.error(f"[Vision Engine] All retries failed for page {page_num}. Last error: {last_exc}")
