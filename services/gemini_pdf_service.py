@@ -432,19 +432,52 @@ CRITICAL RULES:
 # ===========================================================================
 
 _VISION_ENGINE_PROMPT = """
-You are a DIAGRAM COORDINATE DETECTOR. Your ONLY job is to locate visual elements on this exam page.
+You are a DIAGRAM COORDINATE DETECTOR. Your ONLY job is to locate VISUAL elements on this exam page.
 
 Return ONLY a valid JSON array. No prose, no markdown fences, no explanations.
 
 Schema for each detected element:
 {"question_number": "<e.g. 4a or 7(b)(i)>", "y_start_pct": <0-100 float>, "y_end_pct": <0-100 float>}
 
-Rules:
+═══════════════════════════════════════════════════════════════
+RULE 1 — HIGH RECALL FOR DIAGRAMS (MANDATORY, ZERO EXCEPTIONS)
+═══════════════════════════════════════════════════════════════
+You MUST capture EVERY single visual math element that appears on this page.
+This includes, but is not limited to:
+  • Geometrical shapes: triangles, circles, polygons, solids, 2D and 3D figures
+  • Plotted graphs: line graphs, bar charts, histograms, scatter plots, pie charts,
+    cumulative frequency curves, box-and-whisker plots
+  • Coordinate grids and axes: labelled x/y axes, number lines, Cartesian grids
+  • Algebraic or geometric figures: angle diagrams, vectors, transformations,
+    locus diagrams, bearing diagrams, Venn diagrams, tree diagrams
+  • Any hand-drawn or printed visual that a student must READ or INTERPRET to answer
+DO NOT leave any visual math element behind. A missed diagram is a critical failure.
+
+═══════════════════════════════════════════════════════════════
+RULE 2 — NO GARBAGE / ZERO TEXT TABLES (ABSOLUTE PROHIBITION)
+═══════════════════════════════════════════════════════════════
+DO NOT capture ANY of the following — they are NOT diagrams:
+  ✗ Standard text/data tables (e.g. two-column x/y value tables, tally tables)
+  ✗ Blank working/answer spaces, dotted lines, ruled lines, empty boxes
+  ✗ Plain text instructions, question stems, or mark-allocation brackets [2]
+  ✗ Page headers, footers, candidate number boxes, or logos
+  ✗ Printed formulae or worked-text-only answer rows
+If the only thing you see is text arranged in a grid, it is a TEXT TABLE — do NOT capture it.
+
+═══════════════════════════════════════════════════════════════
+RULE 3 — TIGHT CROPPING (PIXEL-PRECISE BOUNDING BOXES)
+═══════════════════════════════════════════════════════════════
+Wrap the bounding box (y_start_pct → y_end_pct) EXACTLY around the visual element only.
+  • y_start_pct: the TOP edge of the drawn figure — NOT the question text above it.
+  • y_end_pct:   the BOTTOM edge of the drawn figure — NOT blank space or text below it.
+  • Exclude surrounding question text, mark brackets, and white-space padding entirely.
+  • Each diagram must get its OWN separate bounding box — never merge two diagrams.
+
+═══════════════════════════════════════════════════════════════
+GENERAL RULES
+═══════════════════════════════════════════════════════════════
 - y_start_pct and y_end_pct are percentages of the TOTAL PAGE HEIGHT (0 = top, 100 = bottom).
-- Only include elements you can PHYSICALLY SEE: graphs, geometric diagrams, grids, coordinate axes, number lines, statistical charts, drawn figures, 3D shapes.
-- NEVER include: blank ruled lines, working areas, page headers, question text, mark brackets.
 - If NO diagrams exist on this page, return exactly: []
-- Do NOT merge separate diagrams from different questions into one bounding box.
 - question_number must identify the question this diagram belongs to (e.g. "4", "4a", "3(b)(ii)").
 """.strip()
 
@@ -496,7 +529,7 @@ async def _run_vision_engine_for_page(
                 err_str = str(e)
                 is_transient = any(code in err_str for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "Too Many Requests"))
                 if is_transient and attempt < 2:
-                    wait_time = 2 ** attempt
+                    wait_time = 4 * (2 ** attempt)  # 4 s, 8 s — gives Google APIs breathing room during 503 High Demand spikes
                     logger.warning(f"[Vision Engine] Rate limit or transient error on page {page_num}, attempt {attempt + 1}/3. Retrying in {wait_time}s. Error: {e}")
                     await asyncio.sleep(wait_time)
                 else:
@@ -558,6 +591,30 @@ async def _run_vision_engine_for_page(
                 continue
             if y0_f >= y1_f or y0_f < 0 or y1_f > 100:
                 continue
+
+            # ── Mathematical Size Limiters ────────────────────────────────────
+            # Guard 1: Reject oversized hallucinations — anything taller than
+            # 65 % of the page is almost certainly a full-page crop or a text
+            # block misidentified as a diagram.
+            height_pct = y1_f - y0_f
+            if height_pct > 65.0:
+                logger.warning(
+                    f"[Vision Engine] Page {page_num} | q={q_num!r} REJECTED: "
+                    f"oversized crop height={height_pct:.1f}% "
+                    f"(y={y0_f:.1f}%–{y1_f:.1f}%). Likely a full-page hallucination."
+                )
+                continue
+
+            # Guard 2: Reject microscopic noise — anything shorter than 2 % of
+            # the page is a stray artefact, not a real diagram worth storing.
+            if height_pct < 2.0:
+                logger.warning(
+                    f"[Vision Engine] Page {page_num} | q={q_num!r} REJECTED: "
+                    f"microscopic crop height={height_pct:.1f}% "
+                    f"(y={y0_f:.1f}%–{y1_f:.1f}%). Likely coordinate noise."
+                )
+                continue
+            # ─────────────────────────────────────────────────────────────────
             validated.append({
                 "question_number": q_num,
                 "y_start_pct": y0_f,
@@ -674,10 +731,47 @@ async def _apply_vision_crops_to_questions(
             if cropped_b64:
                 existing_urls.append(f"data:image/jpeg;base64,{cropped_b64}")
                 coord = coords_to_crop[i] # Get the original coordinate for logging
-                logger.info(
-                    f"[Vision Merge] ✅ Diagram cropped for q={q.get("question_id", "?")} "
-                    f"(page={coord.get("page_num", "?")}, y={coord["y_start_pct"]:.1f}%–{coord["y_end_pct"]:.1f}%)"
-                )
+                # ── Verification Logging ──────────────────────────────────────
+                # Decode the JPEG header to read pixel dimensions so the developer
+                # can confirm the crop without ever opening the database.
+                height_pct = coord["y_end_pct"] - coord["y_start_pct"]
+                try:
+                    import io, struct
+                    raw_bytes = base64.b64decode(cropped_b64)
+                    # Fast JFIF/JPEG dimension scan: walk SOF markers
+                    img_w, img_h = 0, 0
+                    view = memoryview(raw_bytes)
+                    idx = 2  # skip SOI (FF D8)
+                    while idx < len(raw_bytes) - 8:
+                        if view[idx] != 0xFF:
+                            break
+                        marker = view[idx + 1]
+                        seg_len = struct.unpack(">H", bytes(view[idx + 2: idx + 4]))[0]
+                        # SOF0/SOF1/SOF2 markers carry image dimensions
+                        if marker in (0xC0, 0xC1, 0xC2):
+                            img_h = struct.unpack(">H", bytes(view[idx + 5: idx + 7]))[0]
+                            img_w = struct.unpack(">H", bytes(view[idx + 7: idx + 9]))[0]
+                            break
+                        idx += 2 + seg_len
+                    aspect = (img_w / img_h) if img_h else 0.0
+                    size_kb = len(raw_bytes) / 1024
+                    logger.info(
+                        f"[Vision Merge] ✅ Crop verified for q={q.get('question_id', '?')} "
+                        f"(page={coord.get('page_num', '?')}, "
+                        f"y={coord['y_start_pct']:.1f}%–{coord['y_end_pct']:.1f}%, "
+                        f"height_pct={height_pct:.1f}%, "
+                        f"px={img_w}×{img_h}, aspect={aspect:.2f}W:1H, "
+                        f"size={size_kb:.1f}KB)"
+                    )
+                except Exception as _log_err:
+                    # Dimension scan failed — fall back to coordinate-only log
+                    logger.info(
+                        f"[Vision Merge] ✅ Diagram cropped for q={q.get('question_id', '?')} "
+                        f"(page={coord.get('page_num', '?')}, "
+                        f"y={coord['y_start_pct']:.1f}%–{coord['y_end_pct']:.1f}%, "
+                        f"height_pct={height_pct:.1f}%) — pixel read skipped: {_log_err}"
+                    )
+                # ─────────────────────────────────────────────────────────────
             else:
                 coord = coords_to_crop[i]
                 logger.warning(
