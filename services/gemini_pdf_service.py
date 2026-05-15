@@ -353,8 +353,6 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   "questions_array": [
     {{
       "document_type": "Marking Scheme",
-      "curriculum": "{board}", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
-      "paperNumber": <integer>, "session": "<string or null>", "year": <integer>, "paper_reference_key": "<string>",
       "isTemplatizable": false, "variables": [],
       "question_latex": "<question number as a string>",
       "question_id": "<question number as a string>",
@@ -398,8 +396,6 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   "questions_array": [
     {{
       "document_type": "Question Paper",
-      "curriculum": "<same as metadata>", "program": "<same as metadata>", "subjectCode": "<same as metadata>", "tier": "<same as metadata>",
-      "paperNumber": <same as metadata>, "session": "<same as metadata>", "year": <same as metadata>, "paper_reference_key": "<same as metadata>",
       "isTemplatizable": <true | false>, "variables": [],
       "question_latex": "<full question text starting with question number>",
       "official_marking_scheme_latex": null,
@@ -420,7 +416,7 @@ CRITICAL RULES:
    ❌ FORBIDDEN: NEVER trigger for blank spaces, ruled lines, empty working areas, or just because the text says "Draw a histogram/graph".
 4. DIAGRAM OWNERSHIP: If a diagram appears before sub-parts (a), (b), attach it ONLY to the first sub-part (e.g., "4(a)").
 5. "diagram_y_range": The bounding box MUST strictly wrap the visual element. Intentionally EXPAND by adding 0.05 extra whitespace ABOVE and BELOW the extreme pixels.
-6. Duplicate ALL metadata fields inside EVERY question object.
+6. NO METADATA DUPLICATION (CRITICAL): Do NOT duplicate paper-level metadata (curriculum, year, session, paperNumber, subjectCode, etc.) inside individual question objects. ONLY provide them once in the outer 'metadata' object.
 7. {difficulty_rule}
 {prk_instruction}
 {LATEX_RULES}
