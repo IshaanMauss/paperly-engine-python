@@ -693,6 +693,21 @@ async def _apply_vision_crops_to_questions(
             logger.debug(f"[Vision Merge] ⚪ Task A already has real images for q={q.get('question_id', '?')}. Skipping Vision Engine crops.")
             return q
 
+        # Check if question has [NEEDS_CROP] marker OR if its normalized ID exists in vision_lookup
+        has_needs_crop = (
+            isinstance(existing_urls, list) and "[NEEDS_CROP]" in existing_urls
+        ) or existing_urls == "[NEEDS_CROP]"
+        
+        has_vision_lookup_entry = any(
+            question_normalizer.normalize_for_matching(candidate) in vision_lookup
+            for candidate in q_id_candidates
+        )
+        
+        # Skip processing if neither [NEEDS_CROP] nor vision_lookup entry exists
+        if not (has_needs_crop or has_vision_lookup_entry):
+            logger.debug(f"[Vision Merge] ⚪ No [NEEDS_CROP] marker or vision coordinates found for q={q.get('question_id', '?')}")
+            return q
+
         # Collect all coordinates for this question
         coords_to_crop = []
         for candidate in q_id_candidates:

@@ -41,13 +41,15 @@ class ExtractRequest(BaseModel):
     file_name: Optional[str] = Field(default="", description="Original filename for paper_reference_key generation")
     board: str = Field(default="IGCSE", description="Education board (IGCSE or IB)")
     page1_image: Optional[str] = Field(default=None, description="Base64-encoded first page image (for IB extraction)")
+    use_cache: bool = Field(default=False, description="Set to true to use cached results")
 
 
 # Cache results of latex extraction for 4 hours
 @lru_cache(maxsize=100)
 def _hash_image(image_data: str) -> str:
     """Create a hash of the image data for caching"""
-    return hashlib.md5(image_data.encode()).hexdigest()
+    # Use the length and last 4000 characters to create a more unique hash
+    return hashlib.md5(f"{len(image_data)}_{image_data[-4000:]}".encode()).hexdigest()
 
 async def _process_single_page(page_image: str, page_number: int, document_type: str, file_name: str = "", board: str = "IGCSE"):
     # Check cache first
@@ -91,11 +93,12 @@ async def process_image(request: ExtractRequest, background_tasks: BackgroundTas
         file_name = (request.file_name or "").strip()
 
         # Check cache first for the full document
-        document_hash = _hash_image(request.image[:2000])  # Use first 2000 chars for PDF hash
+        # document_hash = _hash_image(request.image[:2000])  # Old hash logic
+        document_hash = _hash_image(request.image)  # Use the new hashing logic
         cache_key = f"{document_hash}_{request.document_type}_{request.board}_{mime_type}"
         
         current_time = time.time()
-        if cache_key in EXTRACTION_CACHE and current_time - EXTRACTION_CACHE[cache_key]["timestamp"] < CACHE_TTL:
+        if request.use_cache and cache_key in EXTRACTION_CACHE and current_time - EXTRACTION_CACHE[cache_key]["timestamp"] < CACHE_TTL:
             print(f"🔄 [Cache Hit] Using cached result for document")
             JOBS_STATUS[job_id]["status"] = "completed"
             return EXTRACTION_CACHE[cache_key]["result"]
