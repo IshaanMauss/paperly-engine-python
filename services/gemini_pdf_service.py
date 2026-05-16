@@ -353,6 +353,8 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   "questions_array": [
     {{
       "document_type": "Marking Scheme",
+      "curriculum": "{board}", "program": "<string or null>", "subjectCode": "<string>", "tier": "<string or null>",
+      "paperNumber": <integer>, "session": "<string or null>", "year": <integer>, "paper_reference_key": "<string>",
       "isTemplatizable": false, "variables": [],
       "question_latex": "<question number as a string>",
       "question_id": "<question number as a string>",
@@ -396,6 +398,8 @@ OUTPUT FORMAT — return ONLY the following JSON object:
   "questions_array": [
     {{
       "document_type": "Question Paper",
+      "curriculum": "<same as metadata>", "program": "<same as metadata>", "subjectCode": "<same as metadata>", "tier": "<same as metadata>",
+      "paperNumber": <same as metadata>, "session": "<same as metadata>", "year": <same as metadata>, "paper_reference_key": "<same as metadata>",
       "isTemplatizable": <true | false>, "variables": [],
       "question_latex": "<full question text starting with question number>",
       "official_marking_scheme_latex": null,
@@ -416,7 +420,7 @@ CRITICAL RULES:
    ❌ FORBIDDEN: NEVER trigger for blank spaces, ruled lines, empty working areas, or just because the text says "Draw a histogram/graph".
 4. DIAGRAM OWNERSHIP: If a diagram appears before sub-parts (a), (b), attach it ONLY to the first sub-part (e.g., "4(a)").
 5. "diagram_y_range": The bounding box MUST strictly wrap the visual element. Intentionally EXPAND by adding 0.05 extra whitespace ABOVE and BELOW the extreme pixels.
-6. NO METADATA DUPLICATION (CRITICAL): Do NOT duplicate paper-level metadata (curriculum, year, session, paperNumber, subjectCode, etc.) inside individual question objects. ONLY provide them once in the outer 'metadata' object.
+6. Duplicate ALL metadata fields inside EVERY question object.
 7. {difficulty_rule}
 {prk_instruction}
 {LATEX_RULES}
@@ -476,7 +480,6 @@ GENERAL RULES
 - If NO diagrams exist on this page, return exactly: []
 - question_number must identify the question this diagram belongs to (e.g. "4", "4a", "3(b)(ii)").
 """.strip()
-
 
 
 _VISION_SEMAPHORE = asyncio.Semaphore(3)
@@ -687,7 +690,7 @@ async def _apply_vision_crops_to_questions(
 
         if already_has_real_image:
             # Task A already produced a real crop — Vision Engine is backup, skip.
-            logger.debug(f"[Vision Merge] ⚪ Task A already has real images for q={q.get("question_id", "?")}. Skipping Vision Engine crops.")
+            logger.debug(f"[Vision Merge] ⚪ Task A already has real images for q={q.get('question_id', '?')}. Skipping Vision Engine crops.")
             return q
 
         # Collect all coordinates for this question
@@ -703,7 +706,7 @@ async def _apply_vision_crops_to_questions(
                 vision_lookup[key] = [] 
 
         if not coords_to_crop:
-            logger.debug(f"[Vision Merge] ⚪ No vision coordinates found for q={q.get("question_id", "?")}")
+            logger.debug(f"[Vision Merge] ⚪ No vision coordinates found for q={q.get('question_id', '?')}")
             return q
 
         # Perform crops for all found coordinates concurrently
@@ -771,8 +774,8 @@ async def _apply_vision_crops_to_questions(
             else:
                 coord = coords_to_crop[i]
                 logger.warning(
-                    f"[Vision Merge] ⚠️ Crop returned None for q={q.get("question_id", "?")} "
-                    f"(page={coord.get("page_num", "?")}, y={coord["y_start_pct"]:.1f}%–{coord["y_end_pct"]:.1f}%)"
+                    f"[Vision Merge] ⚠️ Crop returned None for q={q.get('question_id', '?')} "
+                    f"(page={coord.get('page_num', '?')}, y={coord['y_start_pct']:.1f}%–{coord['y_end_pct']:.1f}%)"
                 )
 
         q["diagram_urls"] = existing_urls
@@ -791,8 +794,8 @@ async def _apply_vision_crops_to_questions(
 
     for coord in unmatched_coords:
         logger.warning(
-            f"[Vision Merge] ⚠️ Vision coordinate for q={coord.get("question_number", "?")} "
-            f"(page={coord.get("page_num", "?")}, y={coord["y_start_pct"]:.1f}%–{coord["y_end_pct"]:.1f}%) "
+            f"[Vision Merge] ⚠️ Vision coordinate for q={coord.get('question_number', '?')} "
+            f"(page={coord.get('page_num', '?')}, y={coord['y_start_pct']:.1f}%–{coord['y_end_pct']:.1f}%) "
             f"was found but not matched to any Task A question ID."
         )
 
@@ -1156,6 +1159,51 @@ def _normalize_response(
 
 
 # ===========================================================================
+# SECTION 7b: Groq-to-Gemini schema converter  ← NEW (Hybrid support)
+# ===========================================================================
+
+def _convert_groq_questions_for_normalize(
+    groq_questions: list,
+    document_type: str,
+) -> list:
+    """
+    Map ExtractedQuestion objects/dicts from groq_slicer into the plain-dict
+    format that _normalize_response's questions_array pipeline expects.
+
+    Field mapping:
+      groq 'question'   → 'question_latex'  (groq uses 'question'; alias map misses it)
+      groq 'latex'      → 'question_latex'  (already in _QUESTION_FIELD_ALIASES as backup)
+      groq 'difficulty' → 'cognitive_demand' (Easy/Medium/Hard → LOW/MEDIUM/HIGH)
+      groq 'board','code','topic' → dropped  (not in ExtractedQuestion schema)
+    """
+    _DIFF_MAP: dict = {
+        "EASY": "LOW", "LOW": "LOW",
+        "MEDIUM": "MEDIUM",
+        "HARD": "HIGH", "HIGH": "HIGH",
+    }
+    output = []
+    for q in groq_questions:
+        raw: dict = q.model_dump() if hasattr(q, "model_dump") else dict(q)
+
+        # question_latex: 'latex' takes priority (already in alias map),
+        # then fall through to 'question' which is NOT in the alias map.
+        q_latex = (raw.get("latex") or "").strip() or (raw.get("question") or "").strip()
+
+        output.append({
+            "question_latex":   q_latex,
+            "question_type":    raw.get("question_type") or "SUBJECTIVE",
+            "options":          raw.get("options") if isinstance(raw.get("options"), list) else [],
+            "document_type":    document_type,
+            "cognitive_demand": _DIFF_MAP.get(
+                str(raw.get("difficulty", "Medium")).upper(), "MEDIUM"
+            ),
+            "diagram_urls":     [],
+            "needs_review":     False,
+        })
+    return output
+
+
+# ===========================================================================
 # SECTION 8: JSON Parser  (ORIGINAL LOGIC PRESERVED)
 # ===========================================================================
 
@@ -1286,7 +1334,180 @@ def _pick_available_model(client: genai.Client, exclude: list = None) -> str:
 
 
 # ===========================================================================
-# SECTION 10: Task A — whole-PDF text extraction (sync, runs in thread)
+# SECTION 10a: Task A — Hybrid OCR+Groq path  ← NEW (cost-optimised)
+# ===========================================================================
+
+async def _task_a_hybrid_ocr_groq(
+    pdf_base64: str,
+    document_type: str,
+    filename: str,
+    board: str = "IGCSE",
+    page1_base64: str = None,
+) -> SlicedQuestionsResponse:
+    """
+    Cost-optimised Task A for Question Papers only:
+      1. Render PDF pages locally via pdf_processor (free).
+      2. OCR each page via Gemini 2.0 Flash / pix2text_ocr (cheap vision calls).
+      3. Concatenate OCR text with page markers for cross-page context.
+      4. Structure questions via Groq Llama-3 / groq_slicer (very cheap).
+      5. Enrich with IB metadata if needed (single-page Gemini call, unchanged).
+      6. Normalise via _normalize_response (unchanged).
+
+    Raises PipelineServiceError on unrecoverable failure so the caller
+    (_task_a_with_fallback) can cleanly activate the Gemini Files API fallback.
+
+    NOTE: This function must NEVER be called for Marking Schemes. The groq_slicer
+    schema lacks total_marks, method_steps, and final_answer. The document_type
+    guard in _task_a_with_fallback enforces this before this function is reached.
+    """
+    # Lazy imports: avoids circular dependencies at module load time.
+    from services.pix2text_ocr import extract_latex_from_image  # noqa: PLC0415
+    from services.groq_slicer import slice_and_format_questions  # noqa: PLC0415
+
+    # ── 1. Render pages ─────────────────────────────────────────────────────
+    print("📄 [Hybrid Task A] Rendering PDF pages for OCR…")
+    page_images: List[str] = await pdf_base64_to_vision_pages_async(pdf_base64, dpi=250)
+    if not page_images:
+        raise PipelineServiceError(
+            stage="hybrid_task_a",
+            message="PDF rendering produced no pages.",
+            details={"provider": "pdf_processor"},
+        )
+    print(f"📄 [Hybrid Task A] {len(page_images)} page(s) rendered.")
+
+    # ── 2. OCR all pages concurrently (rate-limited to 3 parallel calls) ────
+    _OCR_SEMAPHORE = asyncio.Semaphore(3)
+
+    async def _ocr_page(b64: str, idx: int) -> str:
+        async with _OCR_SEMAPHORE:
+            try:
+                text: str = await asyncio.to_thread(extract_latex_from_image, b64)
+                print(f"  ✅ [Hybrid OCR] Page {idx + 1}/{len(page_images)}: {len(text or '')} chars")
+                return text or ""
+            except Exception as exc:
+                logger.warning(f"[Hybrid OCR] Page {idx + 1} failed: {exc} — skipping.")
+                return ""
+
+    page_texts: List[str] = list(
+        await asyncio.gather(*[_ocr_page(img, i) for i, img in enumerate(page_images)])
+    )
+
+    # ── 3. Concatenate with page markers ────────────────────────────────────
+    # Markers do NOT match groq_slicer's question regex (^\s*\d+[\.\)]\s+),
+    # so the chunker ignores them and cross-page question blocks stay intact.
+    segments = [
+        f"--- PAGE {i + 1} ---\n\n{text.strip()}"
+        for i, text in enumerate(page_texts)
+        if text.strip()
+    ]
+    if not segments:
+        raise PipelineServiceError(
+            stage="hybrid_task_a",
+            message="OCR returned empty text for every page.",
+            details={"provider": "pix2text_ocr", "total_pages": len(page_images)},
+        )
+    combined_latex = "\n\n".join(segments)
+    print(
+        f"📝 [Hybrid Task A] Concatenated OCR: {len(combined_latex)} chars, "
+        f"{len(segments)}/{len(page_images)} pages non-empty."
+    )
+
+    # ── 4. Groq structuring ─────────────────────────────────────────────────
+    print("🔧 [Hybrid Task A] Sending combined text to Groq Llama-3…")
+    groq_questions = await asyncio.to_thread(
+        slice_and_format_questions, combined_latex, document_type
+    )
+    if not groq_questions:
+        raise PipelineServiceError(
+            stage="hybrid_task_a",
+            message="Groq slicer returned zero questions.",
+            details={"provider": "groq", "chars_sent": len(combined_latex)},
+        )
+    print(f"✅ [Hybrid Task A] Groq extracted {len(groq_questions)} question(s).")
+
+    # ── 5. Key generation (mirrors _extract_pdf_native_sync exactly) ────────
+    paper_reference_key = ""
+    extra_metadata: dict = {}
+
+    if board.upper() == "IGCSE":
+        paper_reference_key = _generate_igcse_paper_reference_key(filename)
+        print(f"ℹ️  [Hybrid Task A] IGCSE paper key: {paper_reference_key!r}")
+
+    else:
+        # IB: one cheap single-page metadata call — NOT the expensive full-PDF API.
+        ib_metadata: dict = {}
+        if page1_base64:
+            try:
+                ib_metadata = (
+                    await asyncio.to_thread(_extract_ib_metadata_from_page, page1_base64)
+                ) or {}
+            except Exception as ib_exc:
+                logger.warning(f"[Hybrid Task A] IB metadata call failed: {ib_exc}")
+
+        # ref_code extraction from the PDF bytes (local regex — free).
+        normalized_b64 = (
+            pdf_base64.strip().split(",", 1)[-1]
+            if "," in pdf_base64
+            else pdf_base64.strip()
+        )
+        pdf_bytes = base64.b64decode(normalized_b64)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(pdf_bytes)
+                tmp_path = tmp.name
+            ref_code, method = regex_extract_ref_code(tmp_path)
+            if ref_code:
+                session = ib_metadata.get("session", "")
+                year    = ib_metadata.get("year", "")
+                if not session or not year:
+                    prefix = ref_code.session_prefix
+                    if len(prefix) == 4:
+                        year    = "20" + prefix[:2]
+                        session = "may" if prefix[2:] == "25" else "november"
+                paper_reference_key = build_paper_reference_key(
+                    curriculum="ib",
+                    subject=ib_metadata.get("subject_name", ""),
+                    tier=ib_metadata.get("level", ""),
+                    session=session,
+                    year=year,
+                    ref_code_base=ref_code.base,
+                )
+                extra_metadata = {
+                    "ref_code_base": ref_code.base,
+                    "ref_code_full": ref_code.raw,
+                }
+                print(f"ℹ️  [Hybrid Task A] IB key: {paper_reference_key!r} via {method}")
+        except Exception as ref_exc:
+            logger.warning(f"[Hybrid Task A] IB ref-code extraction failed: {ref_exc}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    # ── 6. Schema conversion + normalisation ────────────────────────────────
+    questions_as_dicts = _convert_groq_questions_for_normalize(groq_questions, document_type)
+    parsed_dict = {
+        "metadata": {"curriculum": board.upper(), "paper_reference_key": paper_reference_key},
+        "questions_array": questions_as_dicts,
+    }
+    if extra_metadata:
+        parsed_dict["metadata"].update(extra_metadata)
+
+    return _normalize_response(
+        parsed_dict,
+        filename,
+        document_type,
+        board,
+        generated_paper_reference_key=paper_reference_key,
+        extra_metadata=extra_metadata if board.upper() != "IGCSE" else None,
+    )
+
+
+# ===========================================================================
+# SECTION 10b: Task A — Gemini Files API (original, sync, runs in thread)
 # ===========================================================================
 
 def _extract_pdf_native_sync(
@@ -1502,7 +1723,7 @@ async def extract_pdf_native_gemini(
     Extract structured questions from a PDF using the Decoupled Vision Pattern.
 
     Concurrently runs:
-      Task A — whole-PDF text extraction via Gemini Files API
+      Task A — whole-PDF text extraction (hybrid OCR+Groq for QPs, Gemini for MSs)
       Task B — per-page Vision Engine calls (all pages simultaneously)
 
     Then merges: Vision Engine diagram coordinates are used to crop
@@ -1518,10 +1739,82 @@ async def extract_pdf_native_gemini(
         logger.warning(f"[Vision Engine] Page pre-render failed: {e}. Skipping Task B.")
         vision_pages = []
 
-    # ── Launch Task A + Task B concurrently ──────────────────────────────────
-    task_a = asyncio.to_thread(
-        _extract_pdf_native_sync, pdf_base64, document_type, filename, board, page1_base64
+    # ── Launch Task A (smart routing) + Task B concurrently ─────────────────
+    #
+    # Routing logic — BOTH conditions must be true to use the hybrid path:
+    #   1. HYBRID_TASK_A_ENABLED env-var is "true"  (default: true)
+    #   2. document_type is "Question Paper"
+    #
+    # Marking Schemes ALWAYS bypass the hybrid and go straight to the Gemini
+    # Files API because groq_slicer lacks total_marks / method_steps /
+    # final_answer fields. Routing an MS through Groq would silently discard
+    # all step-by-step grading data — an unacceptable data loss.
+
+    _HYBRID_ENABLED: bool = (
+        os.getenv("HYBRID_TASK_A_ENABLED", "true").lower() == "true"
     )
+    _IS_QUESTION_PAPER: bool = (
+        document_type.strip().title() == "Question Paper"
+    )
+
+    async def _task_a_with_fallback() -> SlicedQuestionsResponse:
+        # ── Gate 1: env-var kill-switch ──────────────────────────────────────
+        if not _HYBRID_ENABLED:
+            print(
+                "ℹ️  [Task A] HYBRID_TASK_A_ENABLED=false — "
+                "routing directly to Gemini Files API."
+            )
+            return await asyncio.to_thread(
+                _extract_pdf_native_sync,
+                pdf_base64, document_type, filename, board, page1_base64,
+            )
+
+        # ── Gate 2: document_type guard ──────────────────────────────────────
+        if not _IS_QUESTION_PAPER:
+            print(
+                f"ℹ️  [Task A] document_type={document_type!r} is not a Question Paper — "
+                "Marking Scheme must use Gemini Files API to preserve "
+                "total_marks / method_steps / final_answer. Bypassing hybrid."
+            )
+            return await asyncio.to_thread(
+                _extract_pdf_native_sync,
+                pdf_base64, document_type, filename, board, page1_base64,
+            )
+
+        # ── Hybrid path (Question Papers only) ───────────────────────────────
+        try:
+            print(
+                f"🚀 [Task A] Hybrid OCR+Groq path active "
+                f"(document_type={document_type!r})…"
+            )
+            result = await _task_a_hybrid_ocr_groq(
+                pdf_base64, document_type, filename, board, page1_base64
+            )
+            print(
+                f"✅ [Task A] Hybrid succeeded — "
+                f"{len(result.questions_array)} question(s) extracted."
+            )
+            return result
+
+        except PipelineServiceError as hybrid_exc:
+            print(
+                f"⚠️  [Task A] Hybrid failed at stage='{hybrid_exc.stage}': "
+                f"{hybrid_exc.message}. Falling back to Gemini Files API…"
+            )
+        except Exception as hybrid_exc:
+            print(
+                f"⚠️  [Task A] Hybrid raised {type(hybrid_exc).__name__}: "
+                f"{hybrid_exc}. Falling back to Gemini Files API…"
+            )
+
+        # ── Fallback (original path — always safe) ───────────────────────────
+        print("📤 [Task A Fallback] Uploading PDF to Gemini Files API…")
+        return await asyncio.to_thread(
+            _extract_pdf_native_sync,
+            pdf_base64, document_type, filename, board, page1_base64,
+        )
+
+    task_a = _task_a_with_fallback()
 
     if vision_pages:
         task_b_coroutines = [
