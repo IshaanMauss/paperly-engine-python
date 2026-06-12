@@ -3093,13 +3093,58 @@ _MS_MARK_CODE_RE = re.compile(
     r"\b((?:M|A|B|SC)[1-9]\d*(?:dep|FT)?|FT|cao|oe|nfww|isw)\b",
     re.IGNORECASE,
 )
+_CAMBRIDGE_LEFT_BRACKET_GLYPHS = "\uf0e6\uf0e7\uf0e8\uf8eb\uf8ec\uf8ed"
+_CAMBRIDGE_RIGHT_BRACKET_GLYPHS = "\uf0f6\uf0f7\uf0f8\uf8f6\uf8f7\uf8f8"
+_CAMBRIDGE_BRACKET_GLYPHS = (
+    _CAMBRIDGE_LEFT_BRACKET_GLYPHS + _CAMBRIDGE_RIGHT_BRACKET_GLYPHS
+)
+
+
+def _normalize_cambridge_private_math(text: str) -> str:
+    """Convert Cambridge private-font bracket stacks into renderable LaTeX."""
+    if not any(ch in text for ch in _CAMBRIDGE_BRACKET_GLYPHS):
+        return text
+
+    left_re = re.compile(f"[{re.escape(_CAMBRIDGE_LEFT_BRACKET_GLYPHS)}]")
+    right_re = re.compile(f"[{re.escape(_CAMBRIDGE_RIGHT_BRACKET_GLYPHS)}]")
+
+    def flush_matrix(lines: list[str], output: list[str]) -> None:
+        if not lines:
+            return
+        entries: list[str] = []
+        for line in lines:
+            clean_line = left_re.sub("", line)
+            clean_line = right_re.sub("", clean_line)
+            clean_line = re.sub(r"\s+", " ", clean_line).strip()
+            if clean_line:
+                entries.append(clean_line)
+        if len(entries) >= 2:
+            output.append("$\\begin{pmatrix}" + r"\\".join(entries) + "\\end{pmatrix}$")
+        elif entries:
+            output.append("(" + entries[0] + ")")
+
+    output_lines: list[str] = []
+    matrix_lines: list[str] = []
+    for raw_line in text.splitlines():
+        if any(ch in raw_line for ch in _CAMBRIDGE_BRACKET_GLYPHS):
+            matrix_lines.append(raw_line)
+            continue
+        flush_matrix(matrix_lines, output_lines)
+        matrix_lines = []
+        output_lines.append(raw_line)
+    flush_matrix(matrix_lines, output_lines)
+    return "\n".join(output_lines)
 
 
 def _clean_native_ms_text(value: Any) -> str:
     text = "" if value is None else str(value)
+    text = _normalize_cambridge_private_math(text)
     text = text.replace("\uf0e6", "(").replace("\uf0f6", ")")
     text = text.replace("\uf0e7", "(").replace("\uf0f7", ")")
     text = text.replace("\uf0e8", "(").replace("\uf0f8", ")")
+    text = text.replace("\uf8eb", "(").replace("\uf8f6", ")")
+    text = text.replace("\uf8ec", "(").replace("\uf8f7", ")")
+    text = text.replace("\uf8ed", "(").replace("\uf8f8", ")")
     text = text.replace("\uf075", "")
     text = text.replace("−", "-").replace("–", "-").replace("—", "-")
     text = re.sub(r"[ \t]+", " ", text)
