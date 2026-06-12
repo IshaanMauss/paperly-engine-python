@@ -3123,6 +3123,19 @@ def _ms_table_row_to_four_cells(row: list[Any]) -> list[str]:
             ]
             output.append("\n".join(non_empty).strip())
         return output
+    if len(cells) == 11:
+        # Some Cambridge MS pages lose one spacer column during PyMuPDF table
+        # detection. The visible columns are still Question | Answer | Marks |
+        # Partial Marks, but a simple first-four-cells fallback drops rows.
+        groups = (cells[0:3], cells[3:5], cells[5:8], cells[8:11])
+        return [
+            "\n".join(
+                _clean_native_ms_text(cell)
+                for cell in group
+                if _clean_native_ms_text(cell)
+            ).strip()
+            for group in groups
+        ]
     padded = [_clean_native_ms_text(cell) for cell in cells[:4]]
     while len(padded) < 4:
         padded.append("")
@@ -3161,6 +3174,15 @@ def _ms_table_logical_cell_rect(table_row: Any, logical_col: int) -> Optional[fi
     cells = list(getattr(table_row, "cells", []) or [])
     if not cells:
         return None
+    if len(cells) == 11:
+        groups = ((0, 3), (3, 5), (5, 8), (8, 11))
+        start, end = groups[min(max(logical_col, 0), 3)]
+        result: Optional[fitz.Rect] = None
+        for cell in cells[start:end]:
+            if cell is None:
+                continue
+            result = _union_optional_rect(result, cell)
+        return result
     group_width = max(1, len(cells) // 4)
     start = logical_col * group_width
     end = min(len(cells), start + group_width)
