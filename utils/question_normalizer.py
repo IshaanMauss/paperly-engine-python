@@ -1,48 +1,65 @@
 import re
+from typing import Optional
+
 
 class QuestionNumberNormalizer:
+    """
+    Parse and format exam question identifiers without mutating the question text.
+
+    The important production rule is that a question label and the question body
+    are separate concepts. For example, in "10 (a) f(x) = 2x - 3", the label is
+    "10(a)" and the payload begins with "f(x) = 2x - 3". The parser must never
+    consume the "f(x)" token as a subpart.
+    """
+
+    _ROMAN_ORDER = [
+        "i", "ii", "iii", "iv", "v",
+        "vi", "vii", "viii", "ix", "x",
+        "xi", "xii", "xiii", "xiv", "xv",
+        "xvi", "xvii", "xviii", "xix", "xx",
+    ]
+    _ROMAN_SET = set(_ROMAN_ORDER)
+    # In maths papers, "(x)" is far more often a function argument than a
+    # tenth-level roman subpart. Treat it as payload, not hierarchy.
+    _LABEL_ROMAN_SET = _ROMAN_SET - {"x"}
+    _TOKEN_ALT = r"(?:xviii|xvii|xvi|xiv|xiii|xii|xi|viii|vii|vi|iv|ix|iii|ii|i|xx|xix|xv|x|v|[a-z])"
+
     def __init__(self):
-        # 🚀 THE FINAL BULLETPROOF REGEX (Handles all spaces, brackets, and word bleeds)
-        self._DEPTH3_REGEX = re.compile(
-            r"^(\d+)"                                         # Group 1: Parent
-            r"(?:"
-                r"\s*[\.\(\)]*\s*"                            # Separator 1: Handles "9(a)", "9 (a)", "9.a" flawlessly
-                # Group 2: Safe letters. Negative lookahead prevents standalone i,v,x consumption.
-                r"([a-hj-uw-zA-HJ-UW-Z]|(?![ivxIVX](?:[\.\(\)\s]|$))[a-zA-Z])" 
-                r"(?![a-zA-Z])"                               # 🔒 LOCK 1: Prevents "6 Solve" from bleeding into "6.s"
-                r"(?:"
-                    r"\s*[\.\(\)]*\s*"                        # Separator 2: Handles "(b)(i)", "(b) (i)", "b.i"
-                    # Group 3: Roman numerals ordered longest to shortest
-                    r"(viii|vii|vi|iv|ix|iii|ii|i|x|v)"
-                    r"(?![a-zA-Z])"                           # 🔒 LOCK 2: Prevents word bleed on roman numerals
-                r")?"
-            r")?",
+        self._ROOT_REGEX = re.compile(r"^\s*[Qq]?\s*(\d+)")
+        self._WRAPPED_TOKEN_REGEX = re.compile(
+            rf"\s*[\(\[]\s*({self._TOKEN_ALT})\s*[\)\]]",
+            re.IGNORECASE,
+        )
+        self._DOTTED_TOKEN_REGEX = re.compile(
+            rf"\s*[\.\-]\s*({self._TOKEN_ALT})(?=$|[^a-zA-Z])",
+            re.IGNORECASE,
+        )
+        self._BARE_TOKEN_REGEX = re.compile(
+            rf"\s+({self._TOKEN_ALT})(?=$|[^a-zA-Z])",
             re.IGNORECASE,
         )
 
-        # Fallback regex for orphaned subparts
         self._ORPHAN_REGEX = re.compile(
-            r"^\s*[\(\[]?\s*([a-z]|viii|vii|vi|iv|ix|iii|ii|i|x|v)\s*[\)\]\.]",
+            rf"^\s*[\(\[]?\s*({self._TOKEN_ALT})\s*[\)\]\.]",
             re.IGNORECASE,
         )
 
     def normalize(self, raw_question_id: str, paper_reference_key: str) -> dict:
         """
-        Normalizes raw question IDs (e.g., '1(b) a square number' or '4(a)(iii)') into 
-        canonical dots format (e.g., '1.b' or '4.a.iii') for QP/MS linking.
+        Normalize raw question IDs such as "1(b)" or "4(a)(iii)" into dot
+        format such as "1.b" or "4.a.iii" for QP/MS linking.
         """
         parts = self._extract_parts(raw_question_id)
-        
-        # If parsing fails to find a number, we mark it as UNKNOWN to trigger a review
+
         if not parts:
             canonical_question_id = "UNKNOWN"
             parent_canonical_id = "UNKNOWN"
         else:
-            canonical_question_id = ".".join(parts)  # e.g., "4.a.iii"
-            parent_canonical_id = parts[0]           # e.g., "4"
-            
+            canonical_question_id = self.canonical_from_parts(parts)
+            parent_canonical_id = self.parent_from_parts(parts)
+
         unified_paper_key = self._generate_unified_paper_key(paper_reference_key)
-        metadata = self._build_question_metadata(parts)
+        metadata = self.build_question_metadata(parts)
 
         return {
             "canonical_question_id": canonical_question_id,
@@ -51,69 +68,201 @@ class QuestionNumberNormalizer:
             "question_number_metadata": metadata,
         }
 
-    def _extract_parts(self, raw_id: str) -> list[str]:
+    def extract_parts(self, raw_id: str) -> list[str]:
+        """Public wrapper used by slicer/orchestration guards."""
+        return self._extract_parts(raw_id)
+
+    def split_label_and_remainder(self, raw_text: str) -> tuple[str, str]:
         """
-        Parse a raw question label into a list of hierarchical parts.
-        Returns up to 3 elements: [parent_digit, letter_subpart, roman_subpart]
+        Return (formatted_label, untouched_remainder) from the leading label.
+
+        The remainder is sliced only at the end of the parsed visual label. This
+        is what preserves inline math like "f(x)" after "10(a)".
         """
-        # 1. Strip leading 'Q' or 'q' noise
-        cleaned = re.sub(r'^[Qq]\s*', '', str(raw_id).strip())
+        parts, span_end = self._extract_parts_with_span(raw_text)
+        if not parts or span_end <= 0:
+            return "", str(raw_text or "")
+        return self.format_parts(parts), str(raw_text or "")[span_end:].lstrip()
 
-        # 2. Primary match via the strict 3-group regex.
-        match = self._DEPTH3_REGEX.match(cleaned)
+    def extract_leading_label(self, raw_text: str) -> str:
+        parts, _ = self._extract_parts_with_span(raw_text)
+        return self.format_parts(parts) if parts else ""
 
-        parts: list[str] = []
-        if match and match.group(1):
-            parts.append(match.group(1))                  # Parent digit(s)
-            if match.group(2):
-                parts.append(match.group(2).lower())      # Letter subpart
-            if match.group(3):
-                parts.append(match.group(3).lower())      # Roman numeral subpart
-            return parts
+    def canonicalize(self, raw_id: str) -> str:
+        parts = self._extract_parts(raw_id)
+        return self.canonical_from_parts(parts) if parts else ""
 
-        # 3. Fallback for orphaned subparts (no parent digit)
-        orphan = self._ORPHAN_REGEX.match(cleaned)
-        if orphan:
-            return [orphan.group(1).lower()]
+    def canonical_from_parts(self, parts: list[str]) -> str:
+        return ".".join(p.lower() for p in parts if p)
 
-        # 4. Completely unparseable
-        return []
+    def parent_from_parts(self, parts: list[str]) -> str:
+        if not parts:
+            return "UNKNOWN"
+        # Root parent is preserved for compatibility with existing sequence checks.
+        return parts[0]
+
+    def immediate_parent_from_parts(self, parts: list[str]) -> str:
+        if len(parts) <= 1:
+            return parts[0] if parts else "UNKNOWN"
+        return self.canonical_from_parts(parts[:-1])
+
+    def build_question_metadata(self, parts: list[str]) -> dict:
+        return self._build_question_metadata(parts)
+
+    def format_parts(self, parts: list[str]) -> str:
+        if not parts:
+            return ""
+        root = str(parts[0]).strip()
+        if not root:
+            return ""
+        suffix = "".join(f"({str(part).strip().lower()})" for part in parts[1:] if part)
+        return f"{root}{suffix}"
+
+    def increment_terminal_part(self, parts: list[str]) -> Optional[list[str]]:
+        """
+        Increment the final hierarchy token structurally.
+
+        Examples:
+            ["5", "c", "i"] -> ["5", "c", "ii"]
+            ["5", "c"]      -> ["5", "d"]
+
+        Root-only IDs are intentionally not incremented because turning a
+        duplicate "10" into "11" is more likely to hide a real extraction split.
+        """
+        if len(parts) < 2:
+            return None
+
+        updated = [str(p).lower() for p in parts]
+        terminal = updated[-1]
+
+        if terminal in self._ROMAN_SET:
+            idx = self._ROMAN_ORDER.index(terminal)
+            if idx + 1 < len(self._ROMAN_ORDER):
+                updated[-1] = self._ROMAN_ORDER[idx + 1]
+                return updated
+            return None
+
+        if len(terminal) == 1 and "a" <= terminal <= "y":
+            updated[-1] = chr(ord(terminal) + 1)
+            return updated
+
+        if terminal.isdigit():
+            updated[-1] = str(int(terminal) + 1)
+            return updated
+
+        return None
 
     def normalize_for_matching(self, raw: str) -> str:
         """
-        Normalise a question identifier for fuzzy cross-engine matching.
-        "4(a)(i)"  → "4ai"
-        "4.a.i"    → "4ai"
-        "4 a i"    → "4ai"
+        Normalize a question identifier for fuzzy cross-engine matching.
+
+        "4(a)(i)" -> "4ai"
+        "4.a.i"   -> "4ai"
+        "4 a i"   -> "4ai"
         """
         if not raw:
             return ""
-        s = str(raw).lower()
-        # Remove all punctuation, whitespace, and normalize common variations
-        s = re.sub(r"\s*\([a-z0-9]+\)", "", s) # Remove (a), (i) etc. but keep the content inside for now
-        s = re.sub(r"[^a-z0-9]", "", s) # Remove all non-alphanumeric
+        parts = self._extract_parts(raw)
+        if parts:
+            return "".join(parts).lower()
+        return re.sub(r"[^a-z0-9]", "", str(raw).lower())
 
-        # Handle cases like "4ai" from "4(a)(i)" or "4.a.i"
-        # This regex specifically targets patterns like 4a, 4ai, 4aii etc.
-        # It's aggressive to ensure matching, e.g., "4 (a) (i)" -> "4ai"
-        match = re.match(r"^(\d+)([a-z]*)(i|ii|iii|iv|v|vi|vii|viii|ix|x)?", s)
-        if match:
-            parts = [match.group(1)]
-            if match.group(2): parts.append(match.group(2))
-            if match.group(3): parts.append(match.group(3))
-            return "".join(parts)
-        return s
+    def _extract_parts(self, raw_id: str) -> list[str]:
+        parts, _ = self._extract_parts_with_span(raw_id)
+        return parts
+
+    def _extract_parts_with_span(self, raw_id: str) -> tuple[list[str], int]:
+        text = str(raw_id or "")
+        if not text.strip():
+            return [], 0
+
+        root_match = self._ROOT_REGEX.match(text)
+        if not root_match:
+            orphan = self._ORPHAN_REGEX.match(text)
+            if orphan:
+                return [orphan.group(1).lower()], orphan.end()
+            return [], 0
+
+        parts: list[str] = [root_match.group(1)]
+        pos = root_match.end()
+
+        # Parse several visible subpart levels. Cambridge MS/QP labels can be
+        # deeper than root + letter + roman, e.g. "1(a)(iv)(a)". Earlier we
+        # capped this at two subparts, which silently truncated valid MS labels
+        # and caused QP/MS parity noise. The token consumer still guards against
+        # math payload such as f(x), so widening this is safe for normal text.
+        for depth in range(5):
+            consumed = self._consume_subpart_token(text, pos, depth)
+            if not consumed:
+                break
+            token, pos = consumed
+            parts.append(token.lower())
+
+        return parts, pos
+
+    def _consume_subpart_token(
+        self,
+        text: str,
+        pos: int,
+        depth: int,
+    ) -> Optional[tuple[str, int]]:
+        wrapped = self._WRAPPED_TOKEN_REGEX.match(text, pos)
+        if wrapped:
+            token = wrapped.group(1).lower()
+            if depth >= 1 and token == "x":
+                return None
+            return token, wrapped.end()
+
+        dotted = self._DOTTED_TOKEN_REGEX.match(text, pos)
+        if dotted:
+            return dotted.group(1), dotted.end()
+
+        bare = self._BARE_TOKEN_REGEX.match(text, pos)
+        if not bare:
+            return None
+
+        token = bare.group(1).lower()
+        end = bare.end()
+        next_non_space = self._next_non_space_char(text, end)
+
+        # Bare "f(" after a root/subpart is almost always a function token,
+        # not a question label: "10(a) f(x) = 2x - 3".
+        if next_non_space == "(":
+            return None
+
+        # Bare tokens followed by operators are usually math payload, not labels.
+        if next_non_space in {"=", "+", "-", "*", "/", "^"}:
+            return None
+
+        if depth == 0:
+            # First bare subpart should be a letter, not a bare roman variable.
+            if token in {"i", "v", "x"}:
+                return None
+            if next_non_space.isalpha():
+                return None
+            if len(token) != 1 or not token.isalpha():
+                return None
+        else:
+            # Third-level bare labels should be roman. This prevents words or
+            # variables after "(a)" from being consumed.
+            if token not in self._LABEL_ROMAN_SET:
+                return None
+
+        return token, end
+
+    @staticmethod
+    def _next_non_space_char(text: str, pos: int) -> str:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        return text[pos] if pos < len(text) else ""
 
     def _generate_unified_paper_key(self, paper_reference_key: str) -> str:
-        # Input: "igcse_0607_m23_qp_22" -> Output: "igcse_0607_m23_22"
-        # Strict removal of doc_type markers to unify QP and MS
         if not paper_reference_key:
             return ""
         unified = re.sub(r'_(qp|ms|er|gt)', '', str(paper_reference_key), flags=re.IGNORECASE)
         return unified.strip()
 
     def _build_question_metadata(self, parts: list[str]) -> dict:
-        # Safely builds the metadata dict ensuring accurate types and depth tracking
         if not parts:
             return {
                 "parent": None,
@@ -121,9 +270,9 @@ class QuestionNumberNormalizer:
                 "depth": 1,
                 "is_orphaned": True,
             }
-            
+
         parent_id = parts[0]
-        
+
         if parent_id.isdigit():
             return {
                 "parent": int(parent_id),
@@ -131,11 +280,10 @@ class QuestionNumberNormalizer:
                 "depth": len(parts),
                 "is_orphaned": False,
             }
-        else:
-            # Handles cases where only a subpart (like 'a' or 'ii') was found
-            return {
-                "parent": None,
-                "subparts": parts,
-                "depth": len(parts) + 1,
-                "is_orphaned": True,
-            }
+
+        return {
+            "parent": None,
+            "subparts": parts,
+            "depth": len(parts) + 1,
+            "is_orphaned": True,
+        }

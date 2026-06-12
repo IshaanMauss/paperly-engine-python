@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Safety padding added on all sides during diagram crop to avoid clipping.
 _CROP_PADDING_PCT: float = 0.03  # 3% of page height/width
+_MAX_FINAL_CROP_HEIGHT_PCT: float = 0.78
+_MAX_FINAL_CROP_WIDTH_PCT: float = 0.98
 
 # JPEG compression quality for cropped diagrams.
 # 88 gives excellent sharpness at ~60% of PNG size.
@@ -189,6 +191,14 @@ def crop_and_compress_diagram(
         x0_pct = _clamp((x_start_pct / 100.0) - padding_pct)
         x1_pct = _clamp((x_end_pct   / 100.0) + padding_pct)
 
+        if (y1_pct - y0_pct) > _MAX_FINAL_CROP_HEIGHT_PCT and (x1_pct - x0_pct) > _MAX_FINAL_CROP_WIDTH_PCT:
+            logger.warning(
+                "crop_and_compress_diagram: refusing near-full-page crop "
+                f"on page {page_num} ({(y1_pct - y0_pct) * 100:.1f}% height, "
+                f"{(x1_pct - x0_pct) * 100:.1f}% width)."
+            )
+            return None
+
         clip = fitz.Rect(
             x0_pct * pw,   # left
             y0_pct * ph,   # top
@@ -200,9 +210,9 @@ def crop_and_compress_diagram(
         if clip.width < 10 or clip.height < 10:
             logger.warning(
                 f"crop_and_compress_diagram: degenerate clip rect {clip} on page {page_num}. "
-                "Falling back to full page."
+                "Skipping crop instead of falling back to full page."
             )
-            clip = page.rect
+            return None
 
         # ------------------------------------------------------------------
         # 4. Rasterise the clipped region at high DPI
