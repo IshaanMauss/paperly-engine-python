@@ -220,3 +220,41 @@ GEMINI_QP_TARGETED_RESCUE_FLASH_FIRST=false
 GEMINI_ALLOW_FILES_FALLBACK=false
 PAPERLY_MS_TABLE_FIRST=true
 ```
+
+## 2026-06-20 IB Runtime Note
+
+IB extraction should be treated as a separate runtime branch from IGCSE.
+
+The tested IB QP was reasonably cheap in page-level Gemini mode:
+
+```text
+17 rendered pages
+about 18 extracted rows
+estimated cost about INR 1.08
+```
+
+The tested IB MS was not acceptable under the current generic MS Gemini path:
+
+```text
+31 rendered pages
+41 extracted rows
+estimated cost about INR 10.87
+front matter was saved as fake MS question rows
+```
+
+Runtime implication:
+
+```text
+Do not send IB MS cover/copyright/instruction pages to Gemini.
+Do not initialize sequence tracking before SECTION A or the first real answer.
+```
+
+Future IB route should:
+
+- classify IB before IGCSE numbering logic runs
+- skip front matter locally
+- use local readable text/table structure first for IB MS
+- send only real answer pages or uncertain blocks to Gemini
+- avoid IGCSE-style exact leaf parity as the only QA signal
+
+Full board-specific notes live in `PAPERLY_IB_BOARD_EXTRACTION_NOTES.md`.

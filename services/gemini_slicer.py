@@ -233,9 +233,10 @@ _QUESTION_NUMBER_NORMALIZER = QuestionNumberNormalizer()
 # Constants
 # ---------------------------------------------------------------------------
 
-# Semaphore: max 3 concurrent Gemini calls — keeps us inside burst quota
-# without sacrificing parallelism on multi-page documents.
-_GEMINI_SEMAPHORE = asyncio.Semaphore(3)
+_GEMINI_MAX_CONCURRENCY = max(1, int(os.getenv("GEMINI_SLICER_MAX_CONCURRENCY", "2")))
+# Keep local/dev bursts modest. Production can raise GEMINI_SLICER_MAX_CONCURRENCY
+# after quota is confirmed.
+_GEMINI_SEMAPHORE = asyncio.Semaphore(_GEMINI_MAX_CONCURRENCY)
 
 _MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 _QP_PRIMARY_MODEL = (
@@ -280,9 +281,11 @@ _QP_TARGETED_RESCUE_FLASH_FIRST = os.getenv("GEMINI_QP_TARGETED_RESCUE_FLASH_FIR
 # A single exhausted page currently invalidates the whole QP response, so one
 # extra targeted retry is cheaper than asking the user to re-run all 20 pages.
 _MAX_RETRIES = max(1, int(os.getenv("GEMINI_MAX_RETRIES", "3")))
-_QP_PRIMARY_RETRIES = max(1, int(os.getenv("GEMINI_QP_PRIMARY_RETRIES", "2")))
+_QP_PRIMARY_RETRIES = max(1, int(os.getenv("GEMINI_QP_PRIMARY_RETRIES", "3")))
 _QP_RESCUE_RETRIES = max(0, int(os.getenv("GEMINI_QP_RESCUE_RETRIES", "0")))
 _RETRY_BASE_DELAY_S = 4.0          # 4 s → 8 s → 16 s
+_FAILED_PAGE_RETRY_PASSES = max(0, int(os.getenv("GEMINI_SLICER_FAILED_PAGE_RETRY_PASSES", "1")))
+_FAILED_PAGE_RETRY_BASE_DELAY_S = float(os.getenv("GEMINI_SLICER_FAILED_PAGE_RETRY_BASE_DELAY_S", "20"))
 _TRANSIENT_ERROR_CODES = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "Too Many Requests")
 _FATAL_ERROR_PHRASES = (
     "monthly spending cap",
@@ -290,8 +293,9 @@ _FATAL_ERROR_PHRASES = (
 )
 
 # Hard limits for bounding-box sanity guards (mirrors gemini_pdf_service.py values)
-_MAX_DIAGRAM_HEIGHT_PCT = 55.0
-_MAX_BUFFERED_DIAGRAM_HEIGHT_PCT = 70.0
+# INCREASED from 55.0 to 70.0 to accept larger diagrams (cumulative frequency, full-page graphs)
+_MAX_DIAGRAM_HEIGHT_PCT = 70.0
+_MAX_BUFFERED_DIAGRAM_HEIGHT_PCT = 85.0  # Increased to accept large diagrams with padding
 
 # REGRESSION FIX: Reset from 5.0 → 2.0.
 # 5.0% was too aggressive — it rejected real compact diagrams (small graphs,
@@ -421,15 +425,32 @@ def _is_geometric_content(region: Dict[str, Any]) -> bool:
         return False
 
     # Accept if any geometric keyword appears in the description.
+    # CRITICAL FIX: Added "table", "frequency", "data" for statistical tables
+    # CRITICAL FIX 2: Added "hemisphere", "sphere", "cone", "labeled", "radius", "diameter"
     geometric_markers = [
         "axis", "axes", "curve", "line", "circle", "polygon", "triangle",
         "rectangle", "square", "graph", "plot", "histogram", "venn",
         "grid", "coordinate", "vertex", "vertices", "point", "points",
         "prism", "cylinder", "diagram", "shape", "angle", "arc",
         "box", "plot", "chart", "bar", "sector", "region",
+        "table", "frequency", "cumulative", "data", "stem-and-leaf",
+        "matrix", "array", "row", "column",
+        # 3D shapes and measurements
+        "hemisphere", "sphere", "cone", "pyramid", "cuboid", "cube",
+        "radius", "diameter", "circumference", "labeled", "dimension",
+        "scale", "measurement", "cm", "meter", "km",
     ]
     region_lower = region_text.lower()
-    return any(marker in region_lower for marker in geometric_markers)
+
+    # If description mentions geometric shapes or measurements, accept it
+    if any(marker in region_lower for marker in geometric_markers):
+        return True
+
+    # Special case: If it says "labeled" or "with", it's likely a diagram
+    if "labeled" in region_lower or ("with" in region_lower and ("cm" in region_lower or "m" in region_lower)):
+        return True
+
+    return False
 
 
 def _extract_strict_diagrams(
@@ -986,6 +1007,8 @@ Before processing any text, scan the ENTIRE page image for visual elements.
      • Function graphs: curves, straight lines, parabolas, trig curves
      • Statistical charts: bar charts, pie charts, histograms, cumulative frequency diagrams,
        stem-and-leaf plots, box plots
+     • Data tables: frequency tables, cumulative frequency tables, value tables (x-y pairs),
+       statistical data tables with multiple rows/columns - THESE ARE DIAGRAMS
      • Number lines (any line with numeric labels or tick marks)
      • Venn diagrams, tree diagrams, probability diagrams
      • Any other non-text mathematical visual — when in doubt, INCLUDE IT
@@ -995,7 +1018,6 @@ Before processing any text, scan the ENTIRE page image for visual elements.
   ❌ DO NOT CAPTURE:
      • Blank answer-writing spaces or ruled lines for student work
      • Dotted lines (......) that are fill-in-the-blank spaces
-     • Pure text tables listing x-y values (no chart or graph present)
      • Page headers, footers, watermarks, or "Turn over" text
      • Page numbers (at top or bottom margins)
      • Stray dots, bullet points, or isolated single characters — these are NEVER diagrams
@@ -1039,6 +1061,9 @@ Before processing any text, scan the ENTIRE page image for visual elements.
               "hemisphere with radius 6cm labeled, NOT TO SCALE"
               "triangle DEF with angle 30° at F, sides (x+4)m and (4x-5)m, NOT TO SCALE"
               "circle with center O, points A(0,5) and B(-3,4) on circumference"
+              "frequency table with height intervals 60-70, 70-90, 90-100 and corresponding frequencies"
+              "cumulative frequency table with columns for height h cm and cumulative frequency"
+              "data table showing x and y values for plotting graph"
     This field is used for server-side validation. An empty string causes
     the region to be treated as unclassified (it will still pass validation,
     but logging will be less informative).
@@ -1110,7 +1135,7 @@ Before processing any text, scan the ENTIRE page image for visual elements.
 
 BUG 3 FIX — QUESTION NUMBERING ANTI-HALLUCINATION (ZERO TOLERANCE):
 
-⚠️⚠️⚠️ TWO CATEGORIES OF ARTIFACTS ARE NEVER QUESTION NUMBERS ⚠️⚠️⚠️
+⚠️⚠️⚠️ THREE CATEGORIES OF ARTIFACTS ARE NEVER QUESTION NUMBERS ⚠️⚠️⚠️
 
 CATEGORY A — PAGE NUMBERS (top-center integers):
    Cambridge prints a bare integer CENTERED at the VERY TOP of every page.
@@ -1120,6 +1145,8 @@ CATEGORY A — PAGE NUMBERS (top-center integers):
    ❌ EXAMPLE BUG: page 9 shows "9" at top-center, body has "(c)(i)" →
       you output "9(c)(i)". THIS IS WRONG. The question root is inherited
       from the previous page (e.g. "4"), correct output is "4(c)(i)".
+   ❌ COMMON ERROR: Seeing "66" at page top → outputting "66.a.iii". WRONG!
+      "66" is the TOTAL MARKS or PAGE NUMBER, never a question number.
 
 CATEGORY B — MARK ALLOCATION BRACKETS (end-of-line integers in [brackets]):
    Cambridge prints "[1]", "[2]", "[3]", "[4]" etc. at the END of every
@@ -1132,9 +1159,17 @@ CATEGORY B — MARK ALLOCATION BRACKETS (end-of-line integers in [brackets]):
       inside square brackets. Real question numbers are LEFT-ALIGNED at
       the START of a line, followed immediately by text or "(a)".
 
+CATEGORY C — TOTAL MARKS / EXAM DURATION (top-right corner):
+   Cambridge prints exam metadata at the top: "Total marks: 130" or "[130]"
+   These are NEVER question numbers. Question numbers in IGCSE are 1-12 typically.
+   ❌ If you see a number > 50, it's NOT a question number. It's total marks.
+   ❌ NEVER output question_id = "66", "130", "150", etc.
+   ✅ Valid IGCSE question numbers: 1-15 (rarely goes above 12)
+
 BEFORE FINALIZING ANY ROOT QUESTION NUMBER — ASK YOURSELF:
    "Is this integer printed top-center with nothing else on its line?" → PAGE NUMBER. Skip it.
    "Is this integer inside [square brackets] at the end of a line?"   → MARK COUNT. Skip it.
+   "Is this integer > 50?"                                             → TOTAL MARKS. Skip it.
    "Does this integer appear LEFT-ALIGNED at the start of a question line,
     followed by text or a sub-part label?"                            → REAL QUESTION. Use it.
 
@@ -2296,6 +2331,27 @@ def _validate_extracted_root(
     except ValueError:
         return raw_id, False
 
+    # CRITICAL FIX: Reject obviously invalid question numbers (total marks, not questions)
+    # IGCSE papers have questions 1-12 typically, never > 20
+    # Numbers like 66, 130, 150 are total marks or exam duration, NOT question numbers
+    if root_int > 50:
+        if last_known_parent_id:
+            corrected_id = last_known_parent_id + remainder
+            logger.warning(
+                f"[GeminiSlicer] Page {page_num} | TOTAL MARKS HALLUCINATION: "
+                f"root={root_str!r} is >50 (likely total marks, not question number). "
+                f"Correcting '{raw_id}' → '{corrected_id}'. needs_review=True."
+            )
+            return corrected_id, True
+        else:
+            # No context to correct with - reject this entry
+            logger.error(
+                f"[GeminiSlicer] Page {page_num} | INVALID QUESTION NUMBER: "
+                f"root={root_str!r} is >50 and no context available. "
+                f"Rejecting '{raw_id}'."
+            )
+            return "", True  # Empty string signals rejection
+
     # 1-based Cambridge page number for this 0-indexed page
     cambridge_page_number = page_num + 1
 
@@ -2678,19 +2734,24 @@ ID INHERITANCE RULE (NON-NEGOTIABLE):
             expected_id_text = ", ".join(page_anchor_ids)
             system_prompt += f"""
 
-PAGE-LOCAL SAVED MARKING-SCHEME NUMBERING CONTRACT (MANDATORY):
+🔒 PAGE-LOCAL SAVED MARKING-SCHEME NUMBERING CONTRACT (ZERO TOLERANCE — MANDATORY):
 The matching Marking Scheme has already been saved. For THIS rendered page,
-the local PDF text pass expects only these canonical IDs:
+the ONLY valid question canonical IDs are:
 {expected_id_text}
 
-Use this page-local list as the numbering whitelist for this page.
-- Prefer these IDs over any page-number-looking root emitted by the model.
-- Do NOT copy IDs from other pages of the paper.
-- Do NOT output an ID outside this page-local list unless the PDF visibly shows a different question label on this same page.
-- If one visible QP block contains multiple expected subparts, split it into separate
-  questions_array objects matching the expected IDs.
-- If a printed QP parent contains child text that the MS splits, output child labels
-  only when they are visibly present in the QP text.
+IRONCLAD RULES (NO EXCEPTIONS):
+- Every question you extract on this page MUST use one of these exact IDs.
+- Do NOT output any question ID that is NOT in this list.
+- Do NOT merge, collapse, or skip any ID in this list that is visually present.
+- Do NOT use the page number, mark brackets, or invented labels as question IDs.
+- If you see a visual question block that CONTAINS multiple expected IDs (e.g. the block
+  for 4(f) contains visible sub-parts (i), (ii), (iii)), you MUST split it into SEPARATE
+  question_array objects — one per expected ID.
+- If a grouped visual block contains sub-parts whose IDs ARE in the list, output each
+  sub-part as its own object with the exact expected ID.
+- CRITICAL: If any expected ID from the list is VISUALLY PRESENT on this page (you can
+  see its label printed in the left margin), you MUST include it. Omitting a visible
+  expected ID is a CRITICAL EXTRACTION FAILURE.
 """
             logger.info(
                 "[GeminiSlicer] Page %s: Injecting %s page-local saved MS canonical ID(s) as QP anchor.",
@@ -3434,8 +3495,8 @@ async def extract_pages_batch(
     # the original burst pattern.
     # ────────────────────────────────────────────────────────────────────────
 
-    _LAUNCH_STAGGER_S = 0.5   # 500 ms deterministic ramp between successive tasks
-    _LAUNCH_JITTER_S  = 0.3   # max 300 ms random spread (uniform) on top of the ramp
+    _LAUNCH_STAGGER_S = float(os.getenv("GEMINI_SLICER_LAUNCH_STAGGER_S", "1.25"))
+    _LAUNCH_JITTER_S = float(os.getenv("GEMINI_SLICER_LAUNCH_JITTER_S", "0.75"))
 
     async def _launch_with_stagger(idx: int, b64: str) -> List[Dict[str, Any]]:
         """
@@ -3477,6 +3538,75 @@ async def extract_pages_batch(
         for item in page_result:
             if isinstance(item, dict) and item.get("_page_failed"):
                 failed_pages.append(item)
+
+    if failed_pages:
+        for retry_pass in range(1, _FAILED_PAGE_RETRY_PASSES + 1):
+            failed_nums = [int(item.get("page_num", -1)) + 1 for item in failed_pages]
+            wait = (_FAILED_PAGE_RETRY_BASE_DELAY_S * retry_pass) + random.uniform(0.0, 5.0)
+            logger.warning(
+                "[GeminiSlicer][FailedPageRetry] pass=%s/%s failed_pages=%s "
+                "waiting %.0fs before retrying only failed page(s).",
+                retry_pass,
+                _FAILED_PAGE_RETRY_PASSES,
+                failed_nums,
+                wait,
+            )
+            await asyncio.sleep(wait)
+
+            retry_indexes = [
+                int(item.get("page_num", -1))
+                for item in failed_pages
+                if isinstance(item.get("page_num"), int)
+                and 0 <= int(item.get("page_num", -1)) < len(page_jpeg_b64_list)
+            ]
+
+            async def _retry_failed_page(order: int, page_index: int) -> List[Dict[str, Any]]:
+                jitter = random.uniform(0.0, _LAUNCH_JITTER_S)
+                delay = (order * _LAUNCH_STAGGER_S) + jitter
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                return await extract_page_with_gemini(
+                    page_jpeg_b64=page_jpeg_b64_list[page_index],
+                    page_num=page_index,
+                    document_type=document_type,
+                    board=board,
+                    paper_reference_key=paper_reference_key,
+                    fallback_metadata=dict(fallback_metadata or {}),
+                )
+
+            retry_results = await asyncio.gather(
+                *[
+                    _retry_failed_page(order, page_index)
+                    for order, page_index in enumerate(retry_indexes)
+                ],
+                return_exceptions=True,
+            )
+
+            for page_index, retry_result in zip(retry_indexes, retry_results):
+                if isinstance(retry_result, Exception):
+                    all_page_results[page_index] = [{
+                        "_page_failed": True,
+                        "page_num": page_index,
+                        "error": str(retry_result),
+                    }]
+                else:
+                    all_page_results[page_index] = retry_result
+
+            failed_pages = []
+            for page_result in all_page_results:
+                if not isinstance(page_result, list):
+                    continue
+                for item in page_result:
+                    if isinstance(item, dict) and item.get("_page_failed"):
+                        failed_pages.append(item)
+
+            if not failed_pages:
+                logger.warning(
+                    "[GeminiSlicer][FailedPageRetry] recovered all failed page(s) "
+                    "on pass=%s.",
+                    retry_pass,
+                )
+                break
 
     if failed_pages:
         failed_nums = [int(item.get("page_num", -1)) + 1 for item in failed_pages]
@@ -3683,6 +3813,19 @@ async def extract_pages_batch(
                 try:
                     _explicit_root_int  = int(_explicit_root)
                     _last_int_for_flush = int(last_known_parent_id) if last_known_parent_id else -1
+
+                    # CRITICAL FIX: Reject total marks/duration (>50) immediately
+                    # Numbers like 66, 130, 150 are NEVER valid question roots
+                    if _explicit_root_int > 50:
+                        logger.warning(
+                            f"[GeminiSlicer][DigitFlush] Page {idx}: "
+                            f"POISONING GUARD — digit flush rejected. "
+                            f"raw_id={raw_id!r}, explicit root='{_explicit_root}', "
+                            f"reason=total marks/duration (>{50}). "
+                            f"Tracker stays at '{last_known_parent_id}'."
+                        )
+                        # Skip the rest of this item processing - continue to next item in page_result
+                        continue
 
                     # ── Plausibility gate (FIX v6-1c — Ghost-N at low Q numbers) ──
                     # Two acceptance tiers:
@@ -3965,11 +4108,13 @@ async def extract_pages_batch(
             # guard will now evaluate "8(a)(i)" against parent "8" (not stale "5"),
             # so Signal 1's continuity test (8 == 8 → same question) will correctly
             # classify it as non-hallucinatory.
+            was_id_corrected = False  # Track if this ID was corrected (hallucination)
             if raw_id and last_known_parent_id:
                 corrected_id, was_corrected = _validate_extracted_root(
                     raw_id, last_known_parent_id, idx
                 )
                 if was_corrected:
+                    was_id_corrected = True  # Remember this for tracker update below
                     # SAFE RE-INSTANTIATION: Prevents Pydantic silent assignment failures
                     try:
                         model_dict = model.model_dump() if hasattr(model, 'model_dump') else model.dict()
@@ -4045,6 +4190,11 @@ async def extract_pages_batch(
             # of the sequence — same number (multi-page question) or any forward
             # step. REJECT backward jumps unconditionally.
             #
+            # CRITICAL FIX: If the question ID was corrected by _validate_extracted_root
+            # (hallucination detected), do NOT update the tracker from the corrected value.
+            # The corrected value is synthetic; using it to update the tracker would
+            # perpetuate the hallucination pattern.
+            #
             # Root cause of the "Ghost 4" bug:
             #   The LLM reads a mark-bracket "[4]" at line-end and emits
             #   question_id="4". After Q12, this is a backward jump (4 < 12).
@@ -4052,72 +4202,87 @@ async def extract_pages_batch(
             #   Every subsequent orphan "(iii)" became "4(iii)".
             #   NEW code rejects the backward jump — tracker stays at "12" —
             #   so the next orphan correctly becomes "12(iii)".
-            current_model = item.get("model")
-            q_id = str(getattr(current_model, "question_id", "") or "").strip()
-            if q_id:
-                q_parts = _QUESTION_NUMBER_NORMALIZER.extract_parts(q_id)
-                q_full_context = _QUESTION_NUMBER_NORMALIZER.format_parts(q_parts)
-                root_match = re.match(r"^(\d+)", q_id)
-                if root_match:
-                    candidate_root = root_match.group(1)
-                    if not last_known_parent_id:
-                        # First question seen — always accept.
-                        last_known_parent_id = candidate_root
-                        if q_full_context:
-                            last_known_question_id = q_full_context
-                    else:
-                        try:
-                            candidate_int = int(candidate_root)
-                            last_int      = int(last_known_parent_id)
-                            cambridge_page_number = idx + 1
-                            final_page_hint_root_conflict = (
-                                not is_ms
-                                and bool(_page_hint_likely_root)
-                                and candidate_root == _page_hint_printed_number
-                                and _page_hint_likely_root != candidate_root
-                            )
-                            is_page_number_leap = (
-                                candidate_int == cambridge_page_number
-                                and (
-                                    candidate_int > last_int + 1
-                                    or final_page_hint_root_conflict
+            if not was_id_corrected:  # Only update tracker for non-corrected IDs
+                current_model = item.get("model")
+                q_id = str(getattr(current_model, "question_id", "") or "").strip()
+                if q_id:
+                    q_parts = _QUESTION_NUMBER_NORMALIZER.extract_parts(q_id)
+                    q_full_context = _QUESTION_NUMBER_NORMALIZER.format_parts(q_parts)
+                    root_match = re.match(r"^(\d+)", q_id)
+                    if root_match:
+                        candidate_root = root_match.group(1)
+                        if not last_known_parent_id:
+                            # First question seen — always accept.
+                            last_known_parent_id = candidate_root
+                            if q_full_context:
+                                last_known_question_id = q_full_context
+                        else:
+                            try:
+                                candidate_int = int(candidate_root)
+                                last_int      = int(last_known_parent_id)
+                                cambridge_page_number = idx + 1
+
+                                # CRITICAL: Reject total marks/duration numbers (>50) immediately
+                                # These are NEVER valid question roots
+                                if candidate_int > 50:
+                                    logger.warning(
+                                        f"[GeminiSlicer] Page {idx}: "
+                                        f"POISONING GUARD — rejected "
+                                        f"last_known_parent_id update from "
+                                        f"'{last_known_parent_id}' to "
+                                        f"'{candidate_root}' (total marks/duration >50). "
+                                        f"Tracker unchanged."
+                                    )
+                                    continue  # Skip this update, keep last_known_parent_id unchanged
+
+                                final_page_hint_root_conflict = (
+                                    not is_ms
+                                    and bool(_page_hint_likely_root)
+                                    and candidate_root == _page_hint_printed_number
+                                    and _page_hint_likely_root != candidate_root
                                 )
-                            )
-                            if (
-                                candidate_int >= last_int
-                                and not is_page_number_leap
-                            ) or (
-                                not is_ms
-                                and _page_hint_expected_roots
-                                and candidate_root in _page_hint_expected_roots
-                            ):
-                                # Forward or same — plausible continuation, unless
-                                # it is a large jump to the printed page number.
-                                # Saved-MS local page hints can also reset a
-                                # tracker poisoned by an earlier hallucinated row.
-                                last_known_parent_id = candidate_root
-                                if q_full_context:
-                                    last_known_question_id = q_full_context
-                            else:
-                                # Backward jump — highly suspicious; reject.
-                                reason = (
-                                    f"page-number leap {last_int} → {candidate_int}"
-                                    if is_page_number_leap
-                                    else f"backward jump {last_int} → {candidate_int}"
+                                is_page_number_leap = (
+                                    candidate_int == cambridge_page_number
+                                    and (
+                                        candidate_int > last_int + 1
+                                        or final_page_hint_root_conflict
+                                    )
                                 )
-                                if final_page_hint_root_conflict:
-                                    reason += f"; local QP skeleton expects root {_page_hint_likely_root}"
-                                logger.warning(
-                                    f"[GeminiSlicer] Page {idx}: "
-                                    f"POISONING GUARD — rejected "
-                                    f"last_known_parent_id update from "
-                                    f"'{last_known_parent_id}' to "
-                                    f"'{candidate_root}' ({reason}). "
-                                    f"Tracker unchanged."
-                                )
-                        except ValueError:
-                            # Non-numeric root — don't update tracker.
-                            pass
+                                if (
+                                    candidate_int >= last_int
+                                    and not is_page_number_leap
+                                ) or (
+                                    not is_ms
+                                    and _page_hint_expected_roots
+                                    and candidate_root in _page_hint_expected_roots
+                                ):
+                                    # Forward or same — plausible continuation, unless
+                                    # it is a large jump to the printed page number.
+                                    # Saved-MS local page hints can also reset a
+                                    # tracker poisoned by an earlier hallucinated row.
+                                    last_known_parent_id = candidate_root
+                                    if q_full_context:
+                                        last_known_question_id = q_full_context
+                                else:
+                                    # Backward jump — highly suspicious; reject.
+                                    reason = (
+                                        f"page-number leap {last_int} → {candidate_int}"
+                                        if is_page_number_leap
+                                        else f"backward jump {last_int} → {candidate_int}"
+                                    )
+                                    if final_page_hint_root_conflict:
+                                        reason += f"; local QP skeleton expects root {_page_hint_likely_root}"
+                                    logger.warning(
+                                        f"[GeminiSlicer] Page {idx}: "
+                                        f"POISONING GUARD — rejected "
+                                        f"last_known_parent_id update from "
+                                        f"'{last_known_parent_id}' to "
+                                        f"'{candidate_root}' ({reason}). "
+                                        f"Tracker unchanged."
+                                    )
+                            except ValueError:
+                                # Non-numeric root — don't update tracker.
+                                pass
 
     if is_ms:
         before_merge_count = len(flat)

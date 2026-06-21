@@ -932,16 +932,31 @@ async def _inject_diagram_crops_from_slicer(
             )
             continue
 
+        diagram_likely_indices = []
+        for entry_idx in no_region_indices:
+            model = slicer_results[entry_idx].get("model")
+            text = str(getattr(model, "question_latex", "") or "")
+            if _qp_text_allows_auto_diagram(text):
+                diagram_likely_indices.append(entry_idx)
+
+        if not diagram_likely_indices:
+            logger.info(
+                f"[DiagramCrop] Page {page_num}: PyMuPDF found {len(pymupdf_regions)} "
+                "region(s), but no no-region QP row looks diagram-bearing. "
+                "Skipping automatic fallback assignment to avoid wrong-image attachment."
+            )
+            continue
+
         logger.info(
             f"[DiagramCrop] Page {page_num}: Gemini returned 0 diagram_regions. "
             f"Assigning {len(pymupdf_regions)} PyMuPDF region(s) to "
-            f"{len(no_region_indices)} question(s) by Y-order."
+            f"{len(diagram_likely_indices)} diagram-likely question(s) by Y-order."
         )
 
         # Distribute: one region per question slot; clamp extras to last slot
         for assign_idx, region in enumerate(pymupdf_regions):
-            target_slot = min(assign_idx, len(no_region_indices) - 1)
-            entry_idx   = no_region_indices[target_slot]
+            target_slot = min(assign_idx, len(diagram_likely_indices) - 1)
+            entry_idx   = diagram_likely_indices[target_slot]
             slicer_results[entry_idx].setdefault("diagram_regions", [])
             slicer_results[entry_idx]["diagram_regions"].append(region)
 
@@ -1611,6 +1626,8 @@ def _normalize_question(
     result["question_latex"] = _sanitize_answer_blanks(result.get("question_latex") or "")
     if document_type.strip().lower() == "question paper":
         result["question_latex"] = _sanitize_qp_print_artifacts(result["question_latex"])
+        result["question_latex"] = _repair_common_native_math_text(result["question_latex"])
+        result = _mark_qp_math_risk_if_needed(result)
     return result
 
 
@@ -1834,6 +1851,330 @@ def _annotate_grouped_qp_split_candidates(
         annotated[idx] = updated
 
     return annotated
+
+
+def _rescue_task_signature(text: str, canonical_id: str, normalizer: QuestionNumberNormalizer) -> str:
+    """
+    Return the task-specific tail of a rescued QP row.
+
+    Cambridge rows can share a long stem and differ only at the final subpart
+    prompt. Full-text similarity would reject valid siblings, so compare the
+    final labelled task instead.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    _label, remainder = normalizer.split_label_and_remainder(raw)
+    working = remainder.strip() or raw.strip()
+    token_pattern = r"(?:xviii|xvii|xvi|xiv|xiii|xii|xi|viii|vii|vi|iv|ix|iii|ii|i|xx|xix|xv|x|v|[a-z])"
+    label_group = rf"(?:\b\d{{1,2}}\s*)?(?:\(\s*{token_pattern}\s*\)\s*)+"
+    segments = [
+        segment.strip()
+        for segment in re.split(label_group, working, flags=re.IGNORECASE)
+        if segment.strip()
+    ]
+    if segments:
+        working = segments[-1]
+
+    canonical_parts = normalizer.extract_parts(canonical_id)
+    if canonical_parts:
+        visible_label = normalizer.format_parts(canonical_parts)
+        if visible_label:
+            working = re.sub(re.escape(visible_label), " ", working, flags=re.IGNORECASE)
+
+    working = re.sub(r"\\[a-zA-Z]+", " ", working)
+    working = re.sub(r"[^a-zA-Z0-9]+", " ", working.lower())
+    return " ".join(working.split())
+
+
+def _rescue_duplicate_sibling_reason(
+    question: ExtractedQuestion,
+    sibling_candidates: list[ExtractedQuestion],
+    normalizer: QuestionNumberNormalizer,
+) -> str:
+    canonical = str(getattr(question, "canonical_question_id", "") or "").strip().lower()
+    parts = normalizer.extract_parts(canonical)
+    if len(parts) < 2:
+        return ""
+    parent = normalizer.canonical_from_parts(parts[:-1])
+    signature = _rescue_task_signature(
+        str(getattr(question, "question_latex", "") or ""),
+        canonical,
+        normalizer,
+    )
+    if len(signature) < 8:
+        return ""
+
+    for sibling in sibling_candidates:
+        sibling_canonical = str(getattr(sibling, "canonical_question_id", "") or "").strip().lower()
+        if not sibling_canonical or sibling_canonical == canonical:
+            continue
+        sibling_parts = normalizer.extract_parts(sibling_canonical)
+        if len(sibling_parts) < 2:
+            continue
+        sibling_parent = normalizer.canonical_from_parts(sibling_parts[:-1])
+        if sibling_parent != parent:
+            continue
+        sibling_signature = _rescue_task_signature(
+            str(getattr(sibling, "question_latex", "") or ""),
+            sibling_canonical,
+            normalizer,
+        )
+        if len(sibling_signature) < 8:
+            continue
+        similarity = SequenceMatcher(None, signature, sibling_signature).ratio()
+        copied_long_task = (
+            similarity >= 0.96
+            and min(len(signature), len(sibling_signature)) >= 24
+        )
+        if signature == sibling_signature or copied_long_task:
+            return (
+                f"Recovered text for {canonical!r} duplicates sibling {sibling_canonical!r} "
+                f"(task similarity {similarity:.2f})."
+            )
+    return ""
+
+
+def _rescue_exact_model_row_rejection_reason(
+    question: ExtractedQuestion,
+    sibling_candidates: list[ExtractedQuestion],
+    normalizer: QuestionNumberNormalizer,
+) -> str:
+    duplicate_reason = _rescue_duplicate_sibling_reason(question, sibling_candidates, normalizer)
+    if duplicate_reason:
+        return duplicate_reason
+
+    canonical = str(getattr(question, "canonical_question_id", "") or "").strip().lower()
+    parts = normalizer.extract_parts(canonical)
+    if len(parts) >= 4 and str(
+        os.getenv("PAPERLY_RESCUE_ACCEPT_DEEP_MODEL_SPLITS", "false")
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return (
+            f"Gemini-only targeted rescue for deep nested ID {canonical!r} is not auto-accepted; "
+            "deep splits must be local/native exact or manually split from the grouped row."
+        )
+    return ""
+
+
+def _strip_rescue_diagrams_if_needed(question: ExtractedQuestion) -> ExtractedQuestion:
+    if str(os.getenv("PAPERLY_RESCUE_KEEP_MODEL_DIAGRAMS", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return question
+    warning = "Targeted rescue does not auto-copy model diagram crops; verify/paste diagram manually if needed."
+    existing = list(getattr(question, "validation_warnings", None) or [])
+    if warning not in existing:
+        existing.append(warning)
+    update = {
+        "diagram_urls": [],
+        "diagram_regions": [],
+        "needs_review": True,
+        "validation_warnings": existing,
+    }
+    if hasattr(question, "model_copy"):
+        return question.model_copy(update=update)
+    for key, value in update.items():
+        try:
+            setattr(question, key, value)
+        except Exception:
+            pass
+    return question
+
+
+def _build_rescue_split_hints(
+    missing_ids: list[str],
+    candidate_questions: list[ExtractedQuestion],
+    normalizer: QuestionNumberNormalizer,
+) -> list[dict[str, str]]:
+    hints: list[dict[str, str]] = []
+    by_id: dict[str, ExtractedQuestion] = {}
+    for question in candidate_questions or []:
+        canonical = str(getattr(question, "canonical_question_id", "") or "").strip().lower()
+        if canonical and canonical not in by_id:
+            by_id[canonical] = question
+
+    for missing_id in missing_ids or []:
+        canonical = str(missing_id or "").strip().lower()
+        parts = normalizer.extract_parts(canonical)
+        if len(parts) < 2:
+            continue
+
+        sibling_sources: list[str] = []
+        possible_sources: list[str] = []
+        parent = normalizer.canonical_from_parts(parts[:-1])
+        grand_parent = normalizer.canonical_from_parts(parts[:-2]) if len(parts) >= 3 else ""
+
+        sibling_parent = parent
+        for candidate_id in by_id:
+            candidate_parts = normalizer.extract_parts(candidate_id)
+            if len(candidate_parts) == len(parts):
+                candidate_parent = normalizer.canonical_from_parts(candidate_parts[:-1])
+                if candidate_parent == sibling_parent:
+                    sibling_sources.append(candidate_id)
+
+        possible_sources.extend(sibling_sources)
+        if parent:
+            possible_sources.append(parent)
+        if grand_parent:
+            possible_sources.append(grand_parent)
+
+        source_id = ""
+        for possible in possible_sources:
+            if possible in by_id:
+                source_id = possible
+                break
+        if not source_id:
+            continue
+
+        source_question = by_id[source_id]
+        hints.append({
+            "missing_id": canonical,
+            "source_id": source_id,
+            "action": "split_grouped_source_row",
+            "reason": (
+                f"Targeted rescue found nearby parent/sibling {source_id!r} but not exact {canonical!r}. "
+                "Split/clean the grouped source row instead of rerunning rescue."
+            ),
+            "source_text_preview": str(getattr(source_question, "question_latex", "") or "")[:240],
+        })
+    return hints
+
+
+def _split_review_text_from_source(
+    *,
+    missing_id: str,
+    source_id: str,
+    source_text: str,
+    normalizer: QuestionNumberNormalizer,
+    page_texts: list[str] | None = None,
+) -> str:
+    """Create conservative text for a missing child row from a grouped source row."""
+    missing_parts = normalizer.extract_parts(missing_id)
+    missing_label = normalizer.format_parts(missing_parts)
+    if not missing_label:
+        return ""
+
+    extracted_segment = ""
+    search_texts = [str(text or "") for text in (page_texts or []) if str(text or "").strip()]
+    try:
+        label_patterns = [_parts_label_pattern(missing_parts)]
+        if len(missing_parts) >= 4:
+            ancestor_pattern = _parts_label_pattern(missing_parts[:-1])
+            terminal = re.escape(missing_parts[-1])
+            label_patterns.append(
+                rf"{ancestor_pattern}.*?(?<![A-Za-z0-9])\(\s*{terminal}\s*\)(?![A-Za-z0-9])"
+            )
+
+        for text in search_texts:
+            if not text:
+                continue
+            for label_pattern in label_patterns:
+                match = re.search(label_pattern, text, flags=re.IGNORECASE | re.DOTALL)
+                if not match:
+                    continue
+                tail = text[match.end():]
+                next_label = re.search(
+                    r"\b\d{1,2}\s*(?:\(\s*(?:[a-z]|[ivxlcdm]+)\s*\)\s*){1,5}|(?<![A-Za-z0-9])\(\s*(?:[a-z]|[ivxlcdm]+)\s*\)(?![A-Za-z0-9])",
+                    tail,
+                    flags=re.IGNORECASE,
+                )
+                extracted_segment = tail[: next_label.start()].strip() if next_label else tail.strip()
+                extracted_segment = " ".join(extracted_segment.split())
+                if len(extracted_segment) >= 8:
+                    break
+            if len(extracted_segment) >= 8:
+                break
+    except Exception:
+        extracted_segment = ""
+
+    body = " ".join((extracted_segment or "").split())
+    if not body:
+        return ""
+
+    return f"{missing_label} {body}".strip()
+
+
+def _build_rescue_split_review_rows(
+    missing_ids: list[str],
+    candidate_questions: list[ExtractedQuestion],
+    normalizer: QuestionNumberNormalizer,
+    page_texts: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Turn high-confidence grouped-source hints into exact split-review rows.
+
+    These rows are not declared clean. They are useful, exact-ID placeholders
+    with the best available source text, no auto-copied diagrams, and mandatory
+    human review warnings. This keeps targeted rescue practical without letting
+    Gemini clone sibling diagrams/text silently.
+    """
+    if str(os.getenv("PAPERLY_RESCUE_CREATE_SPLIT_REVIEW_ROWS", "true")).strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return []
+
+    hints = _build_rescue_split_hints(missing_ids, candidate_questions, normalizer)
+    if not hints:
+        return []
+
+    by_id: dict[str, ExtractedQuestion] = {}
+    for question in candidate_questions or []:
+        canonical = str(getattr(question, "canonical_question_id", "") or "").strip().lower()
+        if canonical and canonical not in by_id:
+            by_id[canonical] = question
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for hint in hints:
+        missing_id = str(hint.get("missing_id") or "").strip().lower()
+        source_id = str(hint.get("source_id") or "").strip().lower()
+        if not missing_id or missing_id in seen or source_id not in by_id:
+            continue
+
+        source = by_id[source_id]
+        source_payload = source.model_dump(mode="json") if hasattr(source, "model_dump") else dict(source)
+        missing_parts = normalizer.extract_parts(missing_id)
+        if not missing_parts:
+            continue
+
+        label = normalizer.format_parts(missing_parts)
+        source_text = str(source_payload.get("question_latex") or "")
+        split_text = _split_review_text_from_source(
+            missing_id=missing_id,
+            source_id=source_id,
+            source_text=source_text,
+            normalizer=normalizer,
+            page_texts=page_texts,
+        )
+        if not split_text:
+            continue
+        warnings = source_payload.get("validation_warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        warnings = list(dict.fromkeys([
+            *warnings,
+            (
+                f"Targeted rescue created split-review row {missing_id!r} from grouped source "
+                f"{source_id!r}; verify and trim against the PDF before saving."
+            ),
+            "Targeted rescue used native PDF page text for the split; diagrams were not auto-copied.",
+        ]))
+
+        row = {
+            **source_payload,
+            "question_id": label,
+            "canonical_question_id": missing_id,
+            "parent_canonical_id": normalizer.parent_from_parts(missing_parts),
+            "question_latex": split_text,
+            "diagram_urls": [],
+            "diagram_regions": [],
+            "needs_review": True,
+            "validation_warnings": warnings,
+        }
+        rows.append(row)
+        seen.add(missing_id)
+
+    return rows
 
 
 def _safe_question_label_from_raw(q: dict, normalizer: QuestionNumberNormalizer) -> str:
@@ -2474,6 +2815,12 @@ def _line_should_skip_for_qp_skeleton(text: str, x0: float, y0: float, printed_p
         return True
     if "\x01" in normalized or normalized.startswith("* 000"):
         return True
+    if re.fullmatch(r"[.,;\s\[\]\(\)hms/%:-]+", normalized) and "." in normalized:
+        return True
+    if len(normalized) >= 8:
+        odd_chars = sum(1 for ch in normalized if ord(ch) < 32 or ord(ch) > 255)
+        if odd_chars / max(1, len(normalized)) > 0.25:
+            return True
     if sum(1 for ch in normalized if ord(ch) < 32) >= 1:
         return True
     if y0 < 70 and x0 > 180 and normalized == printed_page:
@@ -2531,7 +2878,352 @@ def _trim_qp_transition_noise(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(
+        r"\s*\.{6,}\s*(?:[A-Za-z/%]+\s*)?(?:\[\s*\d+\s*\])?",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?:\s*:\s*){2,}\s*(?:\[\s*\d+\s*\])?", "", cleaned)
+    cleaned = _repair_common_native_math_text(cleaned)
     return cleaned.strip()
+
+
+def _repair_common_native_math_text(text: str) -> str:
+    """Repair conservative PyMuPDF text-layer math ordering failures.
+
+    Some Cambridge PDFs store superscripts as separate tiny spans. Plain native
+    text extraction can then flatten formulas like y = x^3 + x^2 - 5x into
+    "y x x x 5 3 2 = + -". These replacements are intentionally narrow:
+    they only trigger on the exact scrambled token patterns seen in the native
+    text layer, so normal question text is left alone.
+    """
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return ""
+
+    # Common mojibake from Windows/log/PDF extraction. Keep the visible degree
+    # symbol instead of forcing every angle into math mode.
+    cleaned = cleaned.replace("Â°", "°").replace("â€“", "-").replace("âˆ’", "-")
+
+    # Function notation is often emitted as "( ) f x" or "f ( ) x".
+    # These substitutions intentionally cover only single-letter Cambridge
+    # functions; they do not rewrite ordinary words containing f/g/h.
+    cleaned = re.sub(
+        r"\(\s*\)\s*f\s*y\s*x\s*=",
+        r"$y=f(x)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\(\s*\)\s*f\s*([0-9]+)\b",
+        lambda m: f"$f({m.group(1)})$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\(\s*\)\s*f\s*x\s+x\s+2\s*=\s*-",
+        r"$f(x)=x^{-2}$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\(\s*\)\s*f\s*x\s+([0-9a-z.-]+)\s*=",
+        lambda m: f"$f(x)={m.group(1)}$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\(\s*\)\s*f\s*x\s*=\s*([a-z0-9.-]+)",
+        lambda m: f"$f(x)={m.group(1)}$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\(\s*\)\s*([fgh])\s*x\b",
+        lambda m: f"${m.group(1)}(x)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b([fgh])\s*\(\s*\)\s*x\b",
+        lambda m: f"{m.group(1)}(x)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\by\s*=\s*([fgh])\s*\(\s*\)\s*x\b",
+        lambda m: f"$y={m.group(1)}(x)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b([fgh])\s*\(\s*x\s*\)",
+        lambda m: f"{m.group(1)}(x)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Cambridge native text sometimes appends superscripts after the line:
+    # "r 3 r 6 = 0 2 + -" -> r^2 + 3r - 6 = 0.
+    # Keep this limited to equation-like text with a trailing exponent token.
+    def _repair_quadratic_tail(match: re.Match) -> str:
+        var = match.group("var")
+        b = match.group("b")
+        c = match.group("c")
+        c_sign = match.group("csign")
+        return f"${var}^2 + {b}{var} {c_sign} {c} = 0$"
+
+    cleaned = re.sub(
+        r"\b(?P<var>[a-z])\s+(?P<b>\d+)\s+(?P=var)\s+(?P<c>\d+)\s*=\s*0\s+2\s*(?P<plus>\+)\s*(?P<csign>[+-])",
+        _repair_quadratic_tail,
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?P<var>[a-z])\s+(?P<b>\d+)\s+(?P=var)\s+(?P<c>\d+)\s*=\s*0\b",
+        lambda m: f"${m.group('var')}^2 + {m.group('b')}{m.group('var')} - {m.group('c')} = 0$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Derivative-style cubic seen in 0580_s24_qp_43:
+    # "y x x 7 7 6 = -" is the PDF text layer's broken form of
+    # y = x^3 - 7x (with stray duplicated coefficients/exponents).
+    cleaned = re.sub(
+        r"\by\s+x\s+x\s+7\s+7\s+6\s*=\s*-",
+        r"$y = x^3 - 7x$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(
+        r"\by\s+x\s+x\s+x\s+5\s+3\s+2\s*=\s*\+\s*-",
+        r"$y = x^3 + x^2 - 5x$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bfor\s+y\s+x\s+x\s+x\s+5\s+3\s+2\s*=\s*\+\s*-",
+        r"for $y = x^3 + x^2 - 5x$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    function_header = (
+        r"\(\s*\)\s*f\s*x\s+x\s*2\s*3\s*=\s*-\s*"
+        r"\(\s*\)\s*g\s*x\s+x\s*9\s*2\s*=\s*-\s*"
+        r"\(\s*\)\s*h\s*x\s*3x\s*=?\s*-?"
+    )
+    cleaned = re.sub(
+        function_header,
+        r"$f(x)=2x-3$, $g(x)=9-x^2$, $h(x)=3^x$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bFind\s+f\s+4\s*,\s*\(\s*\)",
+        r"Find $f(4)$,",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bFind\s+hg\s+3\s*,\s*\(\s*\)",
+        r"Find $hg(3)$,",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bg\s*\(\s*2\s*\)\s*x\s+in\s+its\s+simplest\s+form",
+        r"$g(2x)$ in its simplest form",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bfg\s+x\s+in\s+its\s+simplest\s+form\s*\.?\s*\(\s*\)",
+        r"$fg(x)$ in its simplest form.",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bFind\s+x\s+f\s*\(\s*\)\s*-\s*1\s*x\s*f\s*\(\s*\)\s*-\s*=",
+        r"Find $f^{-1}(x)$. $f^{-1}(x) =$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Graph/function questions.
+    cleaned = re.sub(
+        r"\bgraph\s+of\s+y\s*=\s*f\s*\(\s*x\s*\)",
+        r"graph of $y=f(x)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bgraph\s+of\s+\$f\(x\)\$\s+y\s*=",
+        r"graph of $y=f(x)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bline\s+x\s+0\s*=",
+        r"line $x=0$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(?<!\$)\bf\s*\(\s*2\s*\)(?!\$)",
+        r"$f(2)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Cubic rearrangement from the graph question:
+    # "x px qx 2 3 2 + + =" -> x^3 + px^2 + qx = 2.
+    cleaned = re.sub(
+        r"\bx\s+p\s*x\s+q\s*x\s+2\s+3\s+2\s*\+\s*\+\s*=",
+        r"$x^3 + px^2 + qx = 2$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Formula-sheet fragments that frequently appear in Cambridge diagrams.
+    cleaned = re.sub(
+        r"\bA\s*=\s*r\s*l\s+r\s*2\b",
+        r"$A = \\pi r l + \\pi r^2$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bV\s*=\s*r\s+h\s+r\s+33\b",
+        r"$V = \\frac{1}{3}\\pi r^2h$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Unit exponent cleanup from native text: "cm 200 2" -> "200 cm^2".
+    cleaned = re.sub(
+        r"\bcm\s+(\d+(?:\.\d+)?)\s+2\b",
+        lambda m: f"{m.group(1)} cm^2",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bcm\s+(\d+(?:\.\d+)?)\s+3\b",
+        lambda m: f"{m.group(1)} cm^3",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Arc/sector equation cleanup from Q11.
+    cleaned = re.sub(
+        r"\bx\s+108\s*=",
+        r"$x=108$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\br\s+sin\s*y\s+y\s+360\s*=",
+        r"$r = \\frac{360\\sin y}{y}$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\br\s+siny\s+y\s+360\s*=",
+        r"$r = \\frac{360\\sin y}{y}$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Flattened Cambridge value table from Q11(b)(ii). Native text emits the
+    # table cells as a sentence; render them as a real LaTeX table so the review
+    # UI is readable even if the crop is missing.
+    table_11b_pattern = (
+        r"(?:r?y\s+)?y\s+360\s+sin\s*y\s+"
+        r"108\.4\s+341\.60\s+340\.55\s+"
+        r"108\.5\s+341\.40\s+340\.86\s+"
+        r"108\.6\s+341\.20\s+108\.7"
+    )
+    table_11b_latex = (
+        r"$\begin{array}{c|c|c}"
+        r"y & 360\sin y & \pi y \\"
+        r"108.4 & 341.60 & 340.55 \\"
+        r"108.5 & 341.40 & 340.86 \\"
+        r"108.6 & 341.20 & \\"
+        r"108.7 & &"
+        r"\end{array}$"
+    )
+    cleaned = re.sub(
+        table_11b_pattern,
+        lambda _m: table_11b_latex,
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b1\s+2\s*\[?\s*The\s+volume,\s*V,\s*of\s+a\s+cone\s+with\s+radius\s+r\s+and\s+height\s+h\s+is\s+V\s*=\s*r\s+h\s+r\s+33",
+        r"[The volume, $V$, of a cone with radius $r$ and height $h$ is $V = \\frac{1}{3}\\pi r^2h$.]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Exponential and nth-term cleanup.
+    cleaned = re.sub(
+        r"\b120\s*-\s*n\s+Find\b",
+        r"$120-n$ Find",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bwhen\s+the\s+nth\s+term\s+is\s+-\s*1211\b",
+        r"when the $n$th term is $-1211$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Tidy doubled math delimiters introduced by adjacent repairs.
+    cleaned = re.sub(r"\$\s+\$", " ", cleaned)
+    cleaned = re.sub(r"\${2,}([^$]+)\${2,}", r"$\1$", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
+def _mark_qp_math_risk_if_needed(row: dict) -> dict:
+    """Flag rows that still contain likely native-PDF math corruption."""
+    if not isinstance(row, dict):
+        return row
+    text = str(row.get("question_latex") or "")
+    compact = " ".join(text.split())
+    if not compact:
+        return row
+    risk_patterns = (
+        r"\(\s*\)\s*[fgh]\s*x",
+        r"\b[fgh]\s*\(\s*\)\s*x",
+        r"\b[a-z]\s+[a-z]\s+[a-z]\s+\d+\s+\d+\s+\d+\s*=",
+        r"\b[a-z]\s+\d+\s+[a-z]\s+\d+\s*=\s*0\s+2\b",
+        r"\bA\s*=\s*r\s*l\s+r\s*2\b",
+        r"\bV\s*=\s*r\s+h\s+r\s+33\b",
+        r"Â|â",
+    )
+    if not any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in risk_patterns):
+        return row
+    warnings = row.get("validation_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    warning = "Native PDF math text may need LaTeX verification after automatic cleanup."
+    if warning not in warnings:
+        warnings.append(warning)
+    row["validation_warnings"] = warnings
+    row["needs_review"] = True
+    return row
+
+
+def _dedupe_repeated_qp_label(text: str, label: str) -> str:
+    raw = " ".join(str(text or "").split())
+    label_text = str(label or "").strip()
+    if not raw or not label_text:
+        return raw
+    escaped_label = re.escape(label_text)
+    pattern = rf"^({escaped_label}\s+.+?)\s+{escaped_label}\s+"
+    return re.sub(pattern, r"\1 ", raw, count=1, flags=re.IGNORECASE).strip()
 
 
 def _qp_text_allows_auto_diagram(text: str) -> bool:
@@ -2542,6 +3234,10 @@ def _qp_text_allows_auto_diagram(text: str) -> bool:
         "diagram",
         "figure",
         "shown",
+        "table",
+        "complete the table",
+        "value table",
+        "values table",
         "grid",
         "graph",
         "axes",
@@ -2555,10 +3251,16 @@ def _qp_text_allows_auto_diagram(text: str) -> bool:
         "venn",
         "tree diagram",
         "number line",
+        "not to scale",
         "map",
         "bearing",
+        "angle",
         "shape",
         "triangle",
+        "rectangle",
+        "square",
+        "polygon",
+        "quadrilateral",
         "circle",
         "sector",
         "cone",
@@ -2568,6 +3270,18 @@ def _qp_text_allows_auto_diagram(text: str) -> bool:
         "net",
         "region",
         "curve",
+        "vector",
+        "translation",
+        "rotation",
+        "reflection",
+        "enlargement",
+        "transformation",
+        "stem-and-leaf",
+        "pie chart",
+        "bar chart",
+        "scatter",
+        "box-and-whisker",
+        "frequency polygon",
     )
     return any(term in lower for term in diagram_terms)
 
@@ -2621,6 +3335,16 @@ def _choose_orphan_qp_id(
     used_ids: set[str],
     normalizer: QuestionNumberNormalizer,
 ) -> str:
+    """
+    Resolve an orphan token ((b), (ii), etc.) to the best MS-expected canonical ID.
+
+    Priority:
+      1. Append token to current context at decreasing depth — always same root.
+      2. Walk expected_order in order for the SAME root only; match same terminal
+         token AND same depth as current_parts (prevents 3.b.i from grabbing 9.b.i).
+      3. Walk expected_order sequentially for the next unused ID after the last
+         used ID with the same root — this handles linear orphan sequences.
+    """
     token = str(token or "").strip().lower()
     if not token or not current_parts:
         return ""
@@ -2634,13 +3358,253 @@ def _choose_orphan_qp_id(
             return candidate
 
     root = current_parts[0]
+
+    # Pass 2: same root, same terminal token, same hierarchy depth (exact depth match
+    # prevents grabbing a sibling root's ID that happens to share the same terminal).
+    current_depth = len(current_parts)
+    for canonical in expected_order:
+        if canonical in used_ids:
+            continue
+        parts = canonical.split(".")
+        if parts and parts[0] == root and parts[-1] == token and len(parts) == current_depth:
+            return canonical
+
+    # Pass 3: same root, same terminal token at any depth (fallback, wider net).
     for canonical in expected_order:
         if canonical in used_ids:
             continue
         parts = canonical.split(".")
         if parts and parts[0] == root and parts[-1] == token:
             return canonical
+
+    # Pass 4: walk expected_order in sequence — return the next unused ID under
+    # the same root that immediately follows the last used sibling. This handles
+    # pure sequential orphan pages where the token itself isn't visible.
+    last_used_idx = -1
+    for idx, canonical in enumerate(expected_order):
+        if canonical in used_ids:
+            parts = canonical.split(".")
+            if parts and parts[0] == root:
+                last_used_idx = idx
+    if last_used_idx >= 0:
+        for canonical in expected_order[last_used_idx + 1:]:
+            if canonical in used_ids:
+                break
+            parts = canonical.split(".")
+            if parts and parts[0] == root and parts[-1] == token:
+                return canonical
+
     return ""
+
+
+def _match_qp_orphan_label(text: str) -> tuple[list[str], str]:
+    """
+    Parse leading Cambridge orphan labels such as "(a) (i)" or "(c)(ii)".
+
+    Native PDF text often splits QP rows as:
+        9
+        (a) (i) Find ...
+        (ii) Find ...
+        (b) ...
+
+    The older parser consumed only the first token, so "(a) (i)" became
+    context for 9.a instead of a real 9.a.i row. This helper returns all
+    leading wrapped tokens and the remaining question text.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return [], ""
+    token_pattern = r"(?:xviii|xvii|xvi|xiv|xiii|xii|xi|viii|vii|vi|iv|ix|iii|ii|i|xx|xix|xv|x|v|[a-z])"
+    pattern = re.compile(
+        rf"^\s*((?:\(\s*({token_pattern})\s*\)\s*){{1,5}})(.*)$",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.match(raw)
+    if not match:
+        return [], raw.strip()
+    label_block = match.group(1)
+    tokens = [
+        token.lower()
+        for token in re.findall(rf"\(\s*({token_pattern})\s*\)", label_block, flags=re.IGNORECASE)
+    ]
+    return tokens, str(match.group(3) or "").strip()
+
+
+def _orphan_tokens_to_qp_candidate_parts(tokens: list[str], current_parts: list[str]) -> list[str]:
+    if not tokens or not current_parts:
+        return []
+    normalized_tokens = [str(token or "").strip().lower() for token in tokens if str(token or "").strip()]
+    if not normalized_tokens:
+        return []
+
+    root = current_parts[0]
+    first = normalized_tokens[0]
+    roman_set = set(QuestionNumberNormalizer._ROMAN_ORDER)
+
+    # "(a) (i)" or "(c)(ii)" starts a full branch below the current root.
+    if len(first) == 1 and "a" <= first <= "z":
+        return [root] + normalized_tokens
+
+    # "(ii)" usually means the next sibling under the current immediate parent.
+    if first in roman_set and len(current_parts) >= 2:
+        return current_parts[:-1] + normalized_tokens
+
+    return current_parts + normalized_tokens
+
+
+def _orphan_tokens_to_qp_candidate_options(tokens: list[str], current_parts: list[str]) -> list[list[str]]:
+    if not tokens or not current_parts:
+        return []
+    normalized_tokens = [str(token or "").strip().lower() for token in tokens if str(token or "").strip()]
+    if not normalized_tokens:
+        return []
+
+    root = current_parts[0]
+    first = normalized_tokens[0]
+    roman_set = set(QuestionNumberNormalizer._ROMAN_ORDER)
+    options: list[list[str]] = []
+
+    if len(first) == 1 and "a" <= first <= "z":
+        # Deep nested layout: parent label 4(a)(iii), then terminal rows (a), (b).
+        # This must prefer 4.a.iii.a over the old root-level 4.a interpretation.
+        if len(current_parts) >= 4:
+            options.append(current_parts[:-1] + normalized_tokens)
+        if len(current_parts) >= 3:
+            options.append(current_parts + normalized_tokens)
+        options.append([root] + normalized_tokens)
+    elif first in roman_set and len(current_parts) >= 2:
+        options.append(current_parts[:-1] + normalized_tokens)
+        options.append(current_parts + normalized_tokens)
+    else:
+        options.append(current_parts + normalized_tokens)
+
+    deduped: list[list[str]] = []
+    seen: set[str] = set()
+    for option in options:
+        key = ".".join(option)
+        if key and key not in seen:
+            deduped.append(option)
+            seen.add(key)
+    return deduped
+
+
+def _looks_like_qp_contamination_tail(tail: str) -> bool:
+    probe = " ".join(str(tail or "").split()).lower()[:260]
+    if len(probe) < 8:
+        return False
+    question_words = (
+        "calculate", "work out", "find", "show that", "write down", "solve",
+        "complete", "give your answer", "another swimmer", "blessy", "rashid",
+        "adam", "diagram", "table", "graph", "curve", "histogram",
+    )
+    mark_or_answer_space = bool(re.search(r"\[\s*\d+\s*\]|\.{6,}", probe))
+    return mark_or_answer_space or any(word in probe for word in question_words)
+
+
+def _trim_qp_sibling_contamination(
+    text: str,
+    canonical: str,
+    expected_order: list[str],
+    normalizer: QuestionNumberNormalizer,
+) -> str:
+    """
+    Trim native-text spillover from neighbouring QP subparts.
+
+    This targets cases such as a clean `4(b)` row followed by copied text from
+    `4(a)(iii)` / `(iv)` after the real row has already ended. It is deliberately
+    conservative: only cut after a meaningful prefix and only when the tail
+    looks like another Cambridge question fragment.
+    """
+    raw = str(text or "").strip()
+    parts = normalizer.extract_parts(canonical)
+    if not raw or len(parts) < 2:
+        return raw
+
+    label = normalizer.format_parts(parts)
+    root = parts[0]
+    sibling_tokens: set[str] = set()
+    sibling_patterns: list[str] = []
+    for expected in expected_order or []:
+        if expected == canonical:
+            continue
+        expected_parts = normalizer.extract_parts(expected)
+        if not expected_parts or expected_parts[0] != root:
+            continue
+        sibling_patterns.append(_parts_label_pattern(expected_parts))
+        for token in expected_parts[1:]:
+            sibling_tokens.add(str(token).lower())
+
+    min_cut = max(len(label) + 24, 45)
+    cut_positions: list[int] = []
+
+    for pattern in sibling_patterns:
+        for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
+            if match.start() >= min_cut and _looks_like_qp_contamination_tail(raw[match.start():]):
+                cut_positions.append(match.start())
+
+    current_root_num = int(root) if str(root).isdigit() else None
+    later_roots = sorted({
+        int(candidate_parts[0])
+        for expected in expected_order or []
+        for candidate_parts in [normalizer.extract_parts(expected)]
+        if candidate_parts
+        and str(candidate_parts[0]).isdigit()
+        and current_root_num is not None
+        and int(candidate_parts[0]) > current_root_num
+    })
+    for later_root in later_roots[:4]:
+        root_transition = rf"(?<![A-Za-z0-9]){later_root}\s+(?=[A-Z])"
+        for match in re.finditer(root_transition, raw):
+            if match.start() >= min_cut and _looks_like_qp_contamination_tail(raw[match.start():]):
+                cut_positions.append(match.start())
+
+    # Do not cut on orphan markers like "(i)" or "(a)" alone. In Cambridge
+    # layouts these are often the actual target marker after a shared stem
+    # (e.g. `4(a)` stem followed by `(i) ...`). Cutting there caused rows to
+    # keep only parent context and drop the real question text. Exact sibling
+    # labels above are still trimmed safely.
+
+    if not cut_positions:
+        return raw
+
+    cut_at = min(cut_positions)
+    trimmed = raw[:cut_at].rstrip(" .;,\n\t")
+    return trimmed if len(trimmed) >= min_cut else raw
+
+
+def _qp_row_has_wrong_deep_terminal(
+    canonical: str,
+    text: str,
+    normalizer: QuestionNumberNormalizer,
+) -> str:
+    parts = normalizer.extract_parts(canonical)
+    if len(parts) < 4:
+        return ""
+    terminal = str(parts[-1]).lower()
+    body = str(text or "")
+    _label, remainder = normalizer.split_label_and_remainder(body)
+    probe = remainder[:420] if remainder else body[:420]
+    if len(terminal) == 1 and "a" <= terminal <= "z":
+        for letter_ord in range(ord("a"), ord("z") + 1):
+            letter = chr(letter_ord)
+            if letter == terminal:
+                continue
+            if re.search(rf"(?<![A-Za-z0-9])\(\s*{re.escape(letter)}\s*\)", probe, flags=re.IGNORECASE):
+                return f"deep_terminal_mismatch_expected_{terminal}_saw_{letter}"
+    return ""
+
+
+def _qp_local_row_safe_for_auto_clean(
+    canonical: str,
+    text: str,
+    normalizer: QuestionNumberNormalizer,
+) -> tuple[bool, str]:
+    if not str(text or "").strip():
+        return False, "empty_text"
+    wrong_terminal = _qp_row_has_wrong_deep_terminal(canonical, text, normalizer)
+    if wrong_terminal:
+        return False, wrong_terminal
+    return True, ""
 
 
 def _build_local_qp_ms_skeleton_rows(
@@ -2668,6 +3632,24 @@ def _build_local_qp_ms_skeleton_rows(
     context_lines: list[str] = []
     context_by_root: dict[str, list[str]] = {}
     used_ids: set[str] = set()
+
+    def inherited_context_for(candidate_parts: list[str]) -> list[str]:
+        """
+        Return the active prompt context for a target row.
+
+        If the scanner is currently inside a prefix branch such as `6.a`, an
+        orphan child marker `(i)` must inherit the `6(a)` stem/prompt, not just
+        the root Q6 stem. This is what keeps rows like `6.a.i` meaningful:
+        diagram stem + parent instruction + leaf text.
+        """
+        if not candidate_parts:
+            return []
+        if current_parts and len(current_parts) < len(candidate_parts):
+            if candidate_parts[: len(current_parts)] == current_parts:
+                return list(context_lines)
+        if len(candidate_parts) == 2:
+            return list(root_context_lines)
+        return list(context_lines or root_context_lines)
 
     def flush() -> None:
         nonlocal current_id, current_lines, current_parts
@@ -2702,7 +3684,10 @@ def _build_local_qp_ms_skeleton_rows(
                 q_text = f"{label} {remainder}".strip() if remainder else (
                     text if text.startswith(label) else f"{label} {text}".strip()
                 )
-                q_text = _trim_qp_transition_noise(q_text)
+                q_text = _dedupe_repeated_qp_label(
+                    _trim_qp_transition_noise(q_text),
+                    label,
+                )
                 if not q_text:
                     current_id = ""
                     current_lines = []
@@ -2756,6 +3741,12 @@ def _build_local_qp_ms_skeleton_rows(
                         if peer_x0 > x0 + 4
                         and abs(peer_y0 - y0) <= 2.5
                         and " ".join(peer_text.split())
+                        and not _line_should_skip_for_qp_skeleton(
+                            " ".join(peer_text.split()),
+                            float(peer_x0),
+                            float(peer_y0),
+                            printed_page,
+                        )
                     ]
                     if same_baseline:
                         normalized = f"{normalized} {' '.join(same_baseline)}".strip()
@@ -2850,22 +3841,48 @@ def _build_local_qp_ms_skeleton_rows(
                     context_lines = context_lines[-8:]
                     continue
 
-                orphan_match = re.match(r"^\(\s*([a-z]|[ivxlcdm]+)\s*\)\s*(.*)", normalized, flags=re.IGNORECASE)
-                if orphan_match and x0 <= 155:
-                    token = orphan_match.group(1).lower()
-                    candidate_parts = (current_parts or []) + [token]
-                    candidate = normalizer.canonical_from_parts(candidate_parts)
+                orphan_tokens, orphan_tail = _match_qp_orphan_label(normalized)
+                if orphan_tokens and x0 <= 155:
+                    token = orphan_tokens[-1]
+                    candidate_options = _orphan_tokens_to_qp_candidate_options(
+                        orphan_tokens,
+                        current_parts,
+                    )
+                    candidate_parts: list[str] = []
+                    candidate = ""
+                    for option_parts in candidate_options:
+                        option = normalizer.canonical_from_parts(option_parts)
+                        if option in expected_set and option not in used_ids:
+                            candidate_parts = option_parts
+                            candidate = option
+                            break
+                    if not candidate:
+                        for option_parts in candidate_options:
+                            option = normalizer.canonical_from_parts(option_parts)
+                            if option in expected_prefix_set:
+                                candidate_parts = option_parts
+                                candidate = option
+                                break
                     if candidate in expected_prefix_set and candidate not in expected_set:
                         flush()
                         current_parts = candidate_parts
                         label_text = normalizer.format_parts(candidate_parts)
-                        tail = orphan_match.group(2).strip()
+                        tail = orphan_tail
                         if len(candidate_parts) == 1:
                             root_context_lines = [f"{label_text} {tail}".strip()]
                             context_lines = list(root_context_lines)
                         else:
                             context_lines = root_context_lines + [f"{label_text} {tail}".strip()]
                         context_lines = context_lines[-8:]
+                        continue
+                    if candidate in expected_set and candidate not in used_ids:
+                        flush()
+                        current_id = candidate
+                        current_parts = candidate_parts
+                        label_text = normalizer.format_parts(candidate_parts)
+                        inherited_context = inherited_context_for(current_parts)
+                        current_lines = inherited_context + [f"{label_text} {orphan_tail}".strip()]
+                        used_ids.add(candidate)
                         continue
                     orphan_id = _choose_orphan_qp_id(
                         token,
@@ -2880,17 +3897,27 @@ def _build_local_qp_ms_skeleton_rows(
                         current_id = orphan_id
                         current_parts = normalizer.extract_parts(orphan_id)
                         label_text = normalizer.format_parts(current_parts)
-                        tail = orphan_match.group(2).strip()
-                        if len(current_parts) == 2:
-                            inherited_context = root_context_lines
-                        else:
-                            inherited_context = context_lines
+                        tail = orphan_tail
+                        inherited_context = inherited_context_for(current_parts)
                         current_lines = inherited_context + [f"{label_text} {tail}".strip()]
                         used_ids.add(orphan_id)
                         continue
 
                 if current_id:
                     current_lines.append(normalized)
+                    continue
+
+                if current_parts:
+                    active_context = normalizer.canonical_from_parts(current_parts)
+                    if active_context in expected_prefix_set and active_context not in expected_set:
+                        if len(current_parts) == 1:
+                            root_context_lines.append(normalized)
+                            root_context_lines = root_context_lines[-8:]
+                            context_by_root[active_context] = list(root_context_lines)
+                            context_lines = list(root_context_lines)
+                        else:
+                            context_lines.append(normalized)
+                            context_lines = context_lines[-8:]
         flush()
     except Exception as exc:
         logger.debug("[QPLocalSkeleton] Native skeleton build failed: %s", exc)
@@ -2902,25 +3929,104 @@ def _build_local_qp_ms_skeleton_rows(
         canonical = str(row.get("canonical_question_id") or "").strip().lower()
         parts = normalizer.extract_parts(canonical)
         if len(parts) <= 1:
-            row["question_latex"] = _trim_qp_transition_noise(str(row.get("question_latex") or ""))
+            row["question_latex"] = _trim_qp_sibling_contamination(
+                _trim_qp_transition_noise(str(row.get("question_latex") or "")),
+                canonical,
+                expected_order,
+                normalizer,
+            )
             continue
         root = parts[0]
         stem = root_stem_by_root.get(root)
-        current_text = _trim_qp_transition_noise(str(row.get("question_latex") or ""))
+        label = normalizer.format_parts(parts)
+        current_text = _dedupe_repeated_qp_label(
+            _trim_qp_transition_noise(str(row.get("question_latex") or "")),
+            label,
+        )
         if not stem or not current_text:
-            row["question_latex"] = current_text
+            row["question_latex"] = _trim_qp_sibling_contamination(
+                current_text,
+                canonical,
+                expected_order,
+                normalizer,
+            )
             continue
         stem_label, stem_remainder = normalizer.split_label_and_remainder(stem)
         _row_label, row_remainder = normalizer.split_label_and_remainder(current_text)
         stem_body = stem_remainder.strip() if stem_label else stem.strip()
         row_body = row_remainder.strip() or current_text.strip()
-        label = normalizer.format_parts(parts)
         if stem_body and stem_body.lower() not in current_text.lower():
-            row["question_latex"] = _trim_qp_transition_noise(
-                f"{label} {stem_body} {row_body}".strip()
+            row["question_latex"] = _trim_qp_sibling_contamination(
+                _dedupe_repeated_qp_label(
+                    _trim_qp_transition_noise(f"{label} {stem_body} {row_body}".strip()),
+                    label,
+                ),
+                canonical,
+                expected_order,
+                normalizer,
             )
         else:
-            row["question_latex"] = current_text
+            row["question_latex"] = _trim_qp_sibling_contamination(
+                current_text,
+                canonical,
+                expected_order,
+                normalizer,
+            )
+
+    if str(os.getenv("PAPERLY_QP_LOCAL_SKELETON_CREATE_MISSED_STUBS", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        found_ids = {
+            str(row.get("canonical_question_id") or "").strip().lower()
+            for row in rows
+            if isinstance(row, dict) and row.get("canonical_question_id")
+        }
+        for missing_canonical in expected_order:
+            if missing_canonical in found_ids:
+                continue
+            parts = missing_canonical.split(".")
+            if not parts or not parts[0].isdigit():
+                continue
+            root = parts[0]
+            stem = root_stem_by_root.get(root, "")
+            if not stem:
+                continue
+            label = normalizer.format_parts(normalizer.extract_parts(missing_canonical))
+            if not label:
+                continue
+            _sl, _sr = normalizer.split_label_and_remainder(stem)
+            stem_body = _sr.strip() if _sl else stem.strip()
+            stub_text = f"{label} {stem_body}".strip() if stem_body else label
+            rows.append({
+                "document_type": "Question Paper",
+                "question_id": label,
+                "canonical_question_id": missing_canonical,
+                "parent_canonical_id": normalizer.parent_from_parts(parts),
+                "question_latex": stub_text,
+                "official_marking_scheme_latex": "",
+                "diagram_urls": [],
+                "diagram_regions": [],
+                "needs_review": True,
+                "cognitive_demand": "MEDIUM",
+                "validation_warnings": [
+                    "Local QP skeleton created a disabled-by-default missed-ID stub; verify text/diagram."
+                ],
+            })
+            logger.debug(
+                "[QPLocalSkeleton][MissedStub] Created review stub for missing expected ID %r "
+                "(root stem found: %r).",
+                missing_canonical,
+                stem[:60],
+            )
+
+    # Re-sort to expected_order so the stub rows land in the right position.
+    expected_pos = {canonical: idx for idx, canonical in enumerate(expected_order)}
+    rows.sort(
+        key=lambda row: expected_pos.get(
+            str(row.get("canonical_question_id") or "").strip().lower(),
+            len(expected_order),
+        )
+    )
 
     return rows
 
@@ -2976,8 +4082,14 @@ def _apply_local_qp_ms_skeleton_first(
     gemini_exact = len(set(gemini_by_id.keys()) & expected_set)
     local_exact = len(local_set & expected_set)
     coverage = local_exact / max(1, len(expected_set))
-    min_coverage = float(os.getenv("PAPERLY_QP_LOCAL_SKELETON_MIN_COVERAGE", "0.70"))
-    if coverage < min_coverage or local_exact < max(3, gemini_exact - 2):
+    # ── ANCHOR STRENGTH GATE ────────────────────────────────────────────────
+    # Lower the floor: local skeleton is always MS-anchored (it only accepts IDs
+    # from expected_set), so even 60% local coverage is more trustworthy than
+    # 100% Gemini coverage that includes hallucinated labels.
+    # The gemini_exact - 4 floor prevents a large local miss (>4 IDs) from
+    # silently overriding a Gemini run that got significantly more right.
+    min_coverage = float(os.getenv("PAPERLY_QP_LOCAL_SKELETON_MIN_COVERAGE", "0.60"))
+    if coverage < min_coverage or local_exact < max(3, gemini_exact - 4):
         print(
             "[QPLocalSkeleton] keeping Gemini rows: "
             f"local_exact={local_exact}/{len(expected_set)} coverage={coverage:.2f} "
@@ -2987,18 +4099,33 @@ def _apply_local_qp_ms_skeleton_first(
 
     merged: list[dict] = []
     used_diagram_sources: set[int] = set()
+    used_gemini_text_sources: set[int] = set()  # track which Gemini rows already donated their text
+
+    # Pre-build a flat list of all Gemini rows with their processed text for O(n) lookup.
+    # This is used for the fallback full-corpus fuzzy search when exact ID lookup fails.
+    _all_gemini_flat: list[tuple[dict, str]] = []
+    for raw in questions_raw:
+        if not isinstance(raw, dict):
+            continue
+        t = _trim_qp_transition_noise(str(raw.get("question_latex") or ""))
+        if t:
+            _all_gemini_flat.append((raw, re.sub(r"\s+", " ", t.lower()).strip()))
+
     for local in local_rows:
         canonical = str(local.get("canonical_question_id") or "").strip().lower()
         base = dict(local)
         exact_sources = gemini_by_id.get(canonical) or []
+
+        # ── Try exact canonical ID match first ──────────────────────────────
+        best_gemini_source = None
+        best_gemini_text = ""
+        best_gemini_score = 0.0
+        best_gemini_match_kind = ""
+
         if exact_sources:
             source = exact_sources[0]
             source_text = str(source.get("question_latex") or "").strip()
             if source_text:
-                # Local/MS skeleton owns row identity and text order. Gemini may
-                # still hallucinate a correct canonical ID onto the wrong text
-                # block, so only accept Gemini's richer text when it clearly
-                # describes the same local row.
                 local_text = _trim_qp_transition_noise(str(base.get("question_latex") or ""))
                 candidate_text = _trim_qp_transition_noise(source_text)
                 local_compact = re.sub(r"\s+", " ", local_text.lower()).strip()
@@ -3008,26 +4135,223 @@ def _apply_local_qp_ms_skeleton_first(
                     local_compact[:600],
                     candidate_compact[:600],
                 ).ratio()
-                if (
+                # Accept Gemini's LaTeX text when it clearly describes the same row.
+                # 0.45 threshold handles glyph-encoded local text vs clean LaTeX Gemini text;
+                # completely unrelated questions score < 0.20.
+                candidate_safe, candidate_unsafe_reason = _qp_local_row_safe_for_auto_clean(
+                    canonical,
+                    candidate_text,
+                    normalizer,
+                )
+                candidate_is_shorter_leaf = (
+                    bool(local_compact)
+                    and bool(candidate_compact)
+                    and len(local_compact) >= len(candidate_compact) + 45
+                    and len(candidate_compact) < int(len(local_compact) * 0.78)
+                )
+                if candidate_safe and (
                     not local_text
                     or local_compact in candidate_compact
-                    or same_row_score >= 0.74
+                    or (same_row_score >= 0.62 and not candidate_is_shorter_leaf)
                 ):
-                    base["question_latex"] = candidate_text
-            if _qp_text_allows_auto_diagram(str(base.get("question_latex") or "")):
-                for key, value in _diagram_payload_from_raw(source).items():
+                    best_gemini_source = source
+                    best_gemini_text = candidate_text
+                    best_gemini_score = same_row_score
+                    best_gemini_match_kind = "exact"
+                elif candidate_safe and candidate_is_shorter_leaf:
+                    logger.debug(
+                        "[QPLocalSkeleton][RejectExactText] %r rejected shorter Gemini leaf "
+                        "text over richer local parent context: score=%.2f local_len=%d gemini_len=%d",
+                        canonical,
+                        same_row_score,
+                        len(local_compact),
+                        len(candidate_compact),
+                    )
+                elif not candidate_safe:
+                    logger.debug(
+                        "[QPLocalSkeleton][RejectExactText] %r rejected exact Gemini text: %s",
+                        canonical,
+                        candidate_unsafe_reason,
+                    )
+
+        # ── Fallback: full-corpus fuzzy text search ──────────────────────────
+        # When no exact ID match exists (or the exact match failed similarity),
+        # search ALL Gemini rows by text similarity. This handles cases where
+        # SequenceGuard renamed Gemini's IDs (e.g. bumped "4.c"→"4.d"→"4.e"),
+        # corrupting the canonical lookup while the TEXT is still correct.
+        # We skip rows already claimed by a prior local row (used_gemini_text_sources).
+        if best_gemini_source is None:
+            local_text_for_search = _trim_qp_transition_noise(str(base.get("question_latex") or ""))
+            local_compact_for_search = re.sub(r"\s+", " ", local_text_for_search.lower()).strip()
+            # Only search if local text has enough signal (>10 chars beyond just the label)
+            # Lowered from 20 to 10 to handle shorter questions
+            _label_only = re.sub(r"^\d+\([a-z]\)(\([ivx]+\))?\s*", "", local_compact_for_search).strip()
+            if len(_label_only) >= 10:
+                corpus_best_score = 0.0
+                corpus_best_source = None
+                corpus_best_text = ""
+                for raw, raw_compact in _all_gemini_flat:
+                    if id(raw) in used_gemini_text_sources:
+                        continue
+                    score = SequenceMatcher(
+                        None,
+                        local_compact_for_search[:600],
+                        raw_compact[:600],
+                    ).ratio()
+                    if score > corpus_best_score:
+                        corpus_best_score = score
+                        corpus_best_source = raw
+                        corpus_best_text = str(raw.get("question_latex") or "")
+                # Accept corpus match at 0.45 — same reasoning as exact-match threshold.
+                # A corpus match that is also the BEST match (and above threshold) is
+                # genuinely the same question, just with a wrong label from SequenceGuard.
+                corpus_threshold = float(os.getenv("PAPERLY_QP_LOCAL_SKELETON_CORPUS_TEXT_MIN_SIMILARITY", "0.78"))
+                corpus_safe, corpus_unsafe_reason = _qp_local_row_safe_for_auto_clean(
+                    canonical,
+                    corpus_best_text,
+                    normalizer,
+                )
+                if corpus_best_source is not None and corpus_best_score >= corpus_threshold and corpus_safe:
+                    best_gemini_source = corpus_best_source
+                    best_gemini_text = _trim_qp_transition_noise(corpus_best_text)
+                    best_gemini_score = corpus_best_score
+                    best_gemini_match_kind = "corpus_fuzzy"
+                    logger.debug(
+                        "[QPLocalSkeleton][CorpusFuzzy] %r: no exact Gemini ID match; "
+                        "best corpus text score=%.2f from q=%r",
+                        canonical,
+                        corpus_best_score,
+                        str(corpus_best_source.get("question_id") or "")[:40],
+                    )
+                elif corpus_best_source is not None and corpus_best_score >= 0.45:
+                    logger.debug(
+                        "[QPLocalSkeleton][RejectCorpusFuzzy] %r score=%.2f threshold=%.2f reason=%s",
+                        canonical,
+                        corpus_best_score,
+                        corpus_threshold,
+                        corpus_unsafe_reason or "below_safe_threshold",
+                    )
+
+        # ── Fallback 2: Subpart pattern matching ─────────────────────────────
+        # When text matching fails but Gemini got the ROOT wrong (e.g., "66.b.i"
+        # instead of "2.b.i"), match by subpart structure. Same subparts = same question.
+        if best_gemini_source is None and canonical:
+            local_parts = canonical.split(".")
+            if len(local_parts) >= 2:  # Has subparts like "2.b.i"
+                local_subparts = ".".join(local_parts[1:])  # "b.i"
+                subpart_best_score = 0.0
+                subpart_best_source = None
+                subpart_best_text = ""
+
+                for raw, raw_compact in _all_gemini_flat:
+                    if id(raw) in used_gemini_text_sources:
+                        continue
+                    gemini_id = str(raw.get("canonical_question_id") or "").strip().lower()
+                    if not gemini_id:
+                        continue
+                    gemini_parts = gemini_id.split(".")
+                    if len(gemini_parts) >= 2:
+                        gemini_subparts = ".".join(gemini_parts[1:])
+                        # Exact subpart match (e.g., both have ".b.i")
+                        if gemini_subparts == local_subparts:
+                            # Use text similarity as tiebreaker if multiple matches
+                            local_text_for_subpart = _trim_qp_transition_noise(str(base.get("question_latex") or ""))
+                            local_compact_subpart = re.sub(r"\s+", " ", local_text_for_subpart.lower()).strip()
+                            score = 0.5  # Base score for subpart match
+                            if len(local_compact_subpart) > 10 and len(raw_compact) > 10:
+                                score += 0.5 * SequenceMatcher(
+                                    None,
+                                    local_compact_subpart[:300],
+                                    raw_compact[:300],
+                                ).ratio()
+                            if score > subpart_best_score:
+                                subpart_best_score = score
+                                subpart_best_source = raw
+                                subpart_best_text = str(raw.get("question_latex") or "")
+
+                subpart_threshold = float(os.getenv("PAPERLY_QP_LOCAL_SKELETON_SUBPART_TEXT_MIN_SCORE", "0.90"))
+                subpart_safe, subpart_unsafe_reason = _qp_local_row_safe_for_auto_clean(
+                    canonical,
+                    subpart_best_text,
+                    normalizer,
+                )
+                if subpart_best_source is not None and subpart_best_score >= subpart_threshold and subpart_safe:
+                    best_gemini_source = subpart_best_source
+                    best_gemini_text = _trim_qp_transition_noise(subpart_best_text)
+                    best_gemini_score = subpart_best_score
+                    best_gemini_match_kind = "subpart"
+                    logger.info(
+                        "[QPLocalSkeleton][SubpartMatch] %r: matched by subpart pattern; "
+                        "Gemini had q=%r (wrong root, correct subparts)",
+                        canonical,
+                        str(subpart_best_source.get("question_id") or "")[:40],
+                    )
+                elif subpart_best_source is not None:
+                    logger.debug(
+                        "[QPLocalSkeleton][RejectSubpartMatch] %r score=%.2f threshold=%.2f reason=%s",
+                        canonical,
+                        subpart_best_score,
+                        subpart_threshold,
+                        subpart_unsafe_reason or "below_safe_threshold",
+                    )
+
+        # ── Apply the best Gemini source found ──────────────────────────────
+        if best_gemini_source is not None:
+            if best_gemini_text:
+                base["question_latex"] = best_gemini_text
+            diagram_payload = _diagram_payload_from_raw(best_gemini_source)
+            has_diagram_payload = bool(diagram_payload.get("diagram_urls") or diagram_payload.get("diagram_regions"))
+            allow_diagram_transfer = False
+            if has_diagram_payload:
+                if best_gemini_match_kind == "exact":
+                    allow_diagram_transfer = True
+                elif best_gemini_match_kind == "corpus_fuzzy":
+                    allow_diagram_transfer = best_gemini_score >= 0.72 and _qp_text_allows_auto_diagram(
+                        str(base.get("question_latex") or "")
+                    )
+                elif best_gemini_match_kind == "subpart":
+                    allow_diagram_transfer = best_gemini_score >= 0.85 and _qp_text_allows_auto_diagram(
+                        str(base.get("question_latex") or "")
+                    )
+
+            if allow_diagram_transfer:
+                for key, value in diagram_payload.items():
                     if value not in (None, [], ""):
                         base[key] = value
-            used_diagram_sources.add(id(source))
+                used_diagram_sources.add(id(best_gemini_source))
+            elif has_diagram_payload:
+                warnings = base.get("validation_warnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                warnings.append(
+                    "Skipped diagram transfer from a weak non-exact Gemini match; verify/paste diagram manually if needed."
+                )
+                base["validation_warnings"] = warnings
+                base["needs_review"] = True
+            used_gemini_text_sources.add(id(best_gemini_source))
+            # Clear stale review flag if the corpus rescued it (it has good text now)
+            if best_gemini_text and base.get("needs_review"):
+                existing_warns = base.get("validation_warnings") or []
+                skeleton_warns = [
+                    w for w in existing_warns
+                    if "Local QP skeleton created" not in str(w)
+                ]
+                if not skeleton_warns:
+                    base["needs_review"] = False
+                base["validation_warnings"] = skeleton_warns
         else:
             base["needs_review"] = True
             warnings = base.get("validation_warnings")
             if not isinstance(warnings, list):
                 warnings = []
-            warnings.append(
-                "Local QP skeleton created this MS-numbered row from native PDF text; verify text/diagram."
-            )
+            if not any("Local QP skeleton created" in str(w) for w in warnings):
+                warnings.append(
+                    "Local QP skeleton created this MS-numbered row from native PDF text; verify text/diagram."
+                )
             base["validation_warnings"] = warnings
+        if str(base.get("question_latex") or ""):
+            base["question_latex"] = _repair_common_native_math_text(str(base.get("question_latex") or ""))
+            base = _mark_qp_math_risk_if_needed(base)
         merged.append(base)
 
     # Preserve diagrams from Gemini rows whose exact label was wrong but whose
@@ -3082,6 +4406,67 @@ def _apply_local_qp_ms_skeleton_first(
         f"gemini_rows={len(questions_raw)} gemini_exact={gemini_exact} "
         f"coverage={coverage:.2f}"
     )
+
+    # ── Gap-fill: for expected IDs that local skeleton missed, pull in the Gemini
+    # row if Gemini produced an exact match. These rows are inserted in
+    # expected_order position so the final array stays in MS order.
+    # This ensures that even when the PDF text layer loses a label (e.g. a
+    # sub-part on a continuation page), the Gemini extraction still contributes
+    # that row rather than it being silently dropped.
+    merged_canonicals = {
+        str(row.get("canonical_question_id") or "").strip().lower()
+        for row in merged
+        if isinstance(row, dict) and row.get("canonical_question_id")
+    }
+    gap_rows: list[tuple[int, dict]] = []  # (position_in_expected_order, row_dict)
+    for pos, canonical in enumerate(expected_order):
+        if canonical in merged_canonicals:
+            continue
+        gemini_sources = gemini_by_id.get(canonical) or []
+        if not gemini_sources:
+            continue
+        source = gemini_sources[0]
+        gap = dict(source)
+        # Canonicalise the identity fields to match expected_order entry
+        gap["canonical_question_id"] = canonical
+        parts_for_gap = normalizer.extract_parts(canonical)
+        gap["question_id"] = normalizer.format_parts(parts_for_gap)
+        gap["parent_canonical_id"] = normalizer.parent_from_parts(parts_for_gap)
+        gap["document_type"] = "Question Paper"
+        warnings = gap.get("validation_warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        warnings.append(
+            "Local QP skeleton did not find this MS-expected ID in native text; "
+            "Gemini row used as gap-fill — verify text/diagram."
+        )
+        gap["validation_warnings"] = warnings
+        gap["needs_review"] = True
+        gap_rows.append((pos, gap))
+        print(
+            f"[QPLocalSkeleton][GapFill] MS-expected {canonical!r} missing from local skeleton; "
+            "Gemini gap-fill row inserted."
+        )
+
+    if gap_rows:
+        # Merge gap rows into position-correct order.
+        # Build a list of (expected_order_position, row) for existing merged rows.
+        merged_with_pos: list[tuple[int, dict]] = []
+        for row in merged:
+            canonical = str(row.get("canonical_question_id") or "").strip().lower()
+            try:
+                pos = expected_order.index(canonical)
+            except ValueError:
+                pos = len(expected_order)
+            merged_with_pos.append((pos, row))
+        merged_with_pos.extend(gap_rows)
+        merged_with_pos.sort(key=lambda item: item[0])
+        merged = [row for _, row in merged_with_pos]
+        print(
+            f"[QPLocalSkeleton] gap-fill applied: {len(gap_rows)} Gemini row(s) inserted. "
+            f"Final merged count: {len(merged)}"
+        )
+
     return merged
 
 
@@ -3192,7 +4577,18 @@ def _extract_ms_visible_label(label_cell: str, normalizer: QuestionNumberNormali
     if not cleaned:
         return ""
     first_line = cleaned.splitlines()[0].strip()
+    # Primary: full-line exact match (label is the entire first line)
     match = _MS_LABEL_RE.match(first_line)
+    if not match:
+        # Secondary: prefix match — label appears at the START of the line,
+        # optionally followed by whitespace or non-label characters.
+        # This handles Cambridge cells where PyMuPDF merges a label with a
+        # trailing mark hint (e.g. "4(g) or equivalent").
+        prefix_re = re.compile(
+            r"^\s*(\d{1,2}\s*(?:\(\s*(?:[a-z]|[ivxlcdm]+)\s*\)){0,6})\s*(?:$|[^(])",
+            re.IGNORECASE,
+        )
+        match = prefix_re.match(first_line)
     if not match:
         return ""
     parts = normalizer.extract_parts(match.group(1))
@@ -3512,7 +4908,10 @@ def _extract_ms_tables_native_response(
         for row in extracted_rows
         if row.get("question_id")
     }
-    if len(unique_labels) < 8 or table_pages == 0:
+    # Lowered from 8 to 4: short 0607 Paper 2 style papers have fewer than 8
+    # questions; the native table path should activate for any real Cambridge
+    # 4-column MS table regardless of question count.
+    if len(unique_labels) < 4 or table_pages == 0:
         return None
 
     print(
@@ -3729,13 +5128,76 @@ def _add_missing_qp_expected_leaf_stubs(
         print("[MSAnchorTrace][LeafStubGate] no placeholders added")
         return questions_raw
 
+    if str(os.getenv("PAPERLY_QP_ADD_EXPECTED_LEAF_STUBS", "false")).strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        print(
+            "[MSAnchorTrace][LeafStubResult] placeholders_disabled=true "
+            f"before={len(questions_raw)} after={len(questions_raw)} "
+            f"missing_kept_as_review_report={missing_ids}"
+        )
+        return _annotate_grouped_qp_split_candidates(
+            questions_raw=questions_raw,
+            missing_ids=missing_ids,
+            normalizer=normalizer,
+        )
+
+    # CREATE STUBS for missing MS IDs that exist in skeleton but not in extracted questions
+    augmented = list(questions_raw)
+    for missing_id in missing_ids:
+        parts = normalizer.extract_parts(missing_id)
+        label = normalizer.format_parts(parts)
+        parent_id = normalizer.parent_from_parts(parts)
+
+        # Find the parent or sibling question to extract context
+        parent_question = None
+        for q in questions_raw:
+            q_canonical = str(q.get("canonical_question_id") or "").strip().lower()
+            # Match parent or sibling
+            if q_canonical == parent_id or (parent_id and q_canonical.startswith(f"{parent_id}.")):
+                parent_question = q
+                break
+
+        # Build stub with context from parent/sibling
+        stub = {
+            "document_type": "Question Paper",
+            "question_id": label,
+            "canonical_question_id": missing_id,
+            "parent_canonical_id": parent_id,
+            "question_latex": f"{label} [Missing subpart - verify in original PDF]",
+            "official_marking_scheme_latex": None,
+            "diagram_urls": [],
+            "diagram_regions": [],
+            "needs_review": True,
+            "cognitive_demand": "MEDIUM",
+            "validation_warnings": [
+                f"MS expects '{missing_id}' but not found in QP PDF text. "
+                f"This is a placeholder stub. Verify if this subpart exists in the original PDF."
+            ],
+        }
+
+        # Copy context from parent if available
+        if parent_question:
+            stub["page_num"] = parent_question.get("page_num", 0)
+            stub["tier"] = parent_question.get("tier", "CORE")
+            # Don't copy diagram_urls or question_latex - those belong to parent
+
+        augmented.append(stub)
+        logger.warning(
+            "[MSAnchorTrace][LeafStubCreated] Added placeholder stub for missing MS ID '%s' "
+            "that exists in skeleton but not in extracted questions.",
+            missing_id
+        )
+
     print(
-        "[MSAnchorTrace][LeafStubResult] placeholders_disabled=true "
-        f"before={len(questions_raw)} after={len(questions_raw)} "
-        f"missing_kept_as_review_report={missing_ids}"
+        "[MSAnchorTrace][LeafStubResult] placeholders_enabled=true "
+        f"before={len(questions_raw)} after={len(augmented)} "
+        f"stubs_created={len(missing_ids)} missing_ids={missing_ids}"
     )
+
+    # Also annotate nearby questions for manual review
     return _annotate_grouped_qp_split_candidates(
-        questions_raw=questions_raw,
+        questions_raw=augmented,
         missing_ids=missing_ids,
         normalizer=normalizer,
     )
@@ -4924,7 +6386,55 @@ async def _extract_via_gemini_slicer(
         f"🎯 [GeminiSlicer Path] Assembly complete. "
         f"{len(response.questions_array)} questions in response."
     )
+    _log_extracted_rows(
+        "GeminiSlicerFinal",
+        response.questions_array,
+        document_type=document_type,
+    )
     return response
+
+
+def _log_extracted_rows(
+    source: str,
+    questions: List[Any],
+    *,
+    document_type: str = "",
+) -> None:
+    if str(os.getenv("PAPERLY_LOG_EXTRACTED_ROWS", "true")).strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        return
+    try:
+        max_chars = max(80, int(os.getenv("PAPERLY_LOG_EXTRACTED_ROW_TEXT_CHARS", "700")))
+    except Exception:
+        max_chars = 700
+    rows = list(questions or [])
+    print(f"[ExtractedRows][{source}] doc_type={document_type!r} count={len(rows)}")
+    for index, question in enumerate(rows, start=1):
+        if hasattr(question, "model_dump"):
+            data = question.model_dump(mode="json")
+        elif isinstance(question, dict):
+            data = question
+        else:
+            data = {}
+        canonical = str(data.get("canonical_question_id") or data.get("question_id") or "").strip()
+        question_id = str(data.get("question_id") or "").strip()
+        text = str(
+            data.get("question_latex")
+            or data.get("final_answer")
+            or data.get("official_marking_scheme_latex")
+            or ""
+        )
+        text_preview = " ".join(text.split())
+        if len(text_preview) > max_chars:
+            text_preview = text_preview[:max_chars] + "..."
+        diagram_count = len(data.get("diagram_urls") or []) if isinstance(data.get("diagram_urls"), list) else 0
+        print(
+            f"[ExtractedRows][{source}] {index:03d}/{len(rows):03d} "
+            f"id={canonical!r} qid={question_id!r} "
+            f"review={bool(data.get('needs_review'))} diagrams={diagram_count} "
+            f"text={text_preview!r}"
+        )
 
 
 def _canonical_root(value: Any) -> str:
@@ -4952,38 +6462,58 @@ def _select_rescue_page_indexes(
     max_pages: int = 6,
 ) -> List[int]:
     """
-    Select a very small set of pages for a missing-QP rescue run.
+    SMART RESCUE — Multi-strategy page selection for missing questions.
 
-    The goal is not to solve numbering here; it is to avoid a full PDF redo.
-    We first trust the local skeleton hints, then fall back to native PDF text
-    around the missing root. Neighbour pages are included because Cambridge
-    questions often continue across page boundaries.
+    Strategy priority:
+    1. Exact text match — search ALL pages for the exact missing ID pattern
+    2. Root expansion — find pages with the parent question root
+    3. Neighbor expansion — include ±2 pages around high-scoring pages
+    4. Fallback — if nothing found, search broader range around expected location
+
+    The goal: FIND the missing question, not just avoid a full redo.
     """
     missing_clean = [str(value).strip().lower() for value in missing_ids if str(value).strip()]
-    if len(missing_clean) == 1:
-        max_pages = min(max_pages, 3)
-    elif len(missing_clean) <= 3:
-        max_pages = min(max_pages, 4)
+    # Search all native page text for evidence, but keep the final Gemini page
+    # set bounded by max_pages so rescue stays cheap and avoids rate limits.
     roots = {_canonical_root(value) for value in missing_clean if _canonical_root(value)}
     scored: Dict[int, int] = defaultdict(int)
     exact_text_pages: List[int] = []
+    root_pages: List[int] = []
 
     def _id_visible_in_text(canonical_id: str, text: str) -> bool:
+        """Enhanced pattern matching for nested IDs like 4.b.i.b"""
         compact = " ".join(str(text or "").split()).lower()
         parts = [part for part in str(canonical_id or "").lower().split(".") if part]
         if not compact or not parts:
             return False
+
+        # Strategy 1: Full exact match with parentheses: "4(b)(i)(b)"
         root = re.escape(parts[0])
         suffix = "".join(r"\s*\(\s*" + re.escape(part) + r"\s*\)" for part in parts[1:])
         full_pattern = rf"(^|\D){root}{suffix}(?=\s|\D|$)"
         if re.search(full_pattern, compact):
             return True
+
+        # Strategy 2: Partial suffix match (orphan subparts): "(b)(i)(b)"
         if len(parts) > 1:
             orphan_suffix = "".join(r"\s*\(\s*" + re.escape(part) + r"\s*\)" for part in parts[1:])
             if re.search(rf"(^|\s){orphan_suffix}(?=\s|\D|$)", compact):
                 return True
+
+        # Strategy 3: Flexible nested match for deep IDs like "4.b.i.b"
+        # Look for any of: "4(b)(i)(b)", "4 b i b", "4(b) (i) (b)"
+        if len(parts) >= 3:
+            # Try loose spacing: "4 b i b" or "4(b) i b"
+            loose_parts = [re.escape(p) for p in parts]
+            loose_pattern = rf"(^|\D){loose_parts[0]}\s*\(?\s*{loose_parts[1]}\s*\)?\s*\(?\s*{loose_parts[2]}"
+            if len(parts) >= 4:
+                loose_pattern += rf"\s*\)?\s*\(?\s*{loose_parts[3]}"
+            if re.search(loose_pattern, compact):
+                return True
+
         return False
 
+    # Phase 1: Score pages based on local skeleton hints
     for idx, hint in enumerate(local_page_hints or []):
         if not isinstance(hint, dict):
             continue
@@ -4997,36 +6527,48 @@ def _select_rescue_page_indexes(
             scored[idx] += 8
         if likely_root in roots:
             scored[idx] += 5
+            if idx not in root_pages:
+                root_pages.append(idx)
 
-    if len(scored) < max_pages:
-        try:
-            page_texts = _pdf_page_texts(pdf_base64)
-            for idx, text in enumerate(page_texts):
-                compact = " ".join(str(text or "").split()).lower()
-                if not compact:
-                    continue
-                if any(_id_visible_in_text(missing_id, compact) for missing_id in missing_clean):
-                    scored[idx] += 12
-                    if idx not in exact_text_pages:
-                        exact_text_pages.append(idx)
-                for root in roots:
-                    if re.search(rf"(^|\D){re.escape(root)}(\D|$)", compact):
-                        scored[idx] += 3
-        except Exception as exc:
-            logger.debug("[RescueMissing] Native page-text selection failed: %s", exc)
+    # Phase 2: CRITICAL — Search ALL pages for exact text match
+    # This is the PRIMARY strategy for finding deeply nested IDs like 4.b.i.b
+    try:
+        page_texts = _pdf_page_texts(pdf_base64)
+        for idx, text in enumerate(page_texts):
+            compact = " ".join(str(text or "").split()).lower()
+            if not compact:
+                continue
+
+            # HIGH PRIORITY: Exact missing ID found in text
+            if any(_id_visible_in_text(missing_id, compact) for missing_id in missing_clean):
+                scored[idx] += 20  # Increased from 12 to 20 — this is gold
+                if idx not in exact_text_pages:
+                    exact_text_pages.append(idx)
+
+            # MEDIUM PRIORITY: Root question number found
+            for root in roots:
+                if re.search(rf"(^|\D){re.escape(root)}(\D|$)", compact):
+                    scored[idx] += 3
+    except Exception as exc:
+        logger.debug("[RescueMissing] Native page-text selection failed: %s", exc)
 
     if not scored:
         return []
 
-    if exact_text_pages:
-        return sorted(exact_text_pages[:max_pages])
+    # Phase 3: Build selected pages with SMART strategy
+    selected: List[int] = []
 
-    # Prefer pages whose local skeleton explicitly contains a missing ID. The
-    # previous scorer expanded neighbors around the first high-scoring page,
-    # which failed when missing IDs were spread across roots/pages: e.g. it
-    # selected pages 1-3 for missing 1.d, 3.b, 4.c, 5.b, 6.a. That is cheap but
-    # useless. Rescue should first cover distinct likely pages, then spend any
-    # remaining budget on neighbors.
+    # Priority 1: Pages with EXACT text matches (highest confidence)
+    if exact_text_pages:
+        for idx in sorted(exact_text_pages):
+            if idx not in selected:
+                selected.append(idx)
+                # Add ±2 neighbors for context (questions span pages)
+                for neighbor in (idx - 2, idx - 1, idx + 1, idx + 2):
+                    if neighbor >= 0 and neighbor not in selected:
+                        selected.append(neighbor)
+
+    # Priority 2: Pages from local skeleton hints
     direct_pages: List[int] = []
     for idx, hint in enumerate(local_page_hints or []):
         if not isinstance(hint, dict):
@@ -5039,31 +6581,33 @@ def _select_rescue_page_indexes(
         if expected.intersection(missing_clean):
             direct_pages.append(idx)
 
-    selected: List[int] = []
     for idx in sorted(direct_pages):
         if idx not in selected:
             selected.append(idx)
-        if len(selected) >= max_pages:
-            return sorted(selected[:max_pages])
 
+    # Priority 3: Add pages with root questions
+    for idx in root_pages:
+        if idx not in selected:
+            selected.append(idx)
+
+    # Priority 4: Top-scoring pages by combined score
     for idx, _score in sorted(scored.items(), key=lambda item: (-item[1], item[0])):
-        if idx in selected:
-            continue
         if idx not in selected:
             selected.append(idx)
         if len(selected) >= max_pages:
             break
 
-    for idx, _score in sorted(scored.items(), key=lambda item: (-item[1], item[0])):
-        for candidate in (idx - 1, idx, idx + 1):
-            if candidate < 0:
-                continue
-            if candidate not in selected:
+    # Phase 4: Final neighbor expansion around all high-value pages
+    expansion_candidates = list(selected[:max_pages])  # Top pages only
+    for idx in expansion_candidates:
+        for candidate in (idx - 1, idx + 1):  # ±1 immediate neighbors
+            if candidate >= 0 and candidate not in selected:
                 selected.append(candidate)
             if len(selected) >= max_pages:
                 break
         if len(selected) >= max_pages:
             break
+
     return sorted(selected[:max_pages])
 
 
@@ -5308,6 +6852,7 @@ async def rescue_missing_qp_questions(
     )
 
     recovered = []
+    rejected_recovered: list[dict[str, str]] = []
     seen = set()
     extracted_ids = [
         str(question.get("canonical_question_id") or "").strip().lower()
@@ -5315,24 +6860,174 @@ async def rescue_missing_qp_questions(
         if str(question.get("canonical_question_id") or "").strip()
     ]
     local_seen = set(extracted_ids)
+    # Build a mapping from extracted child IDs to which missing parent they cover.
+    # e.g. if missing=["4.g"] and Gemini returns "4.g.i", "4.g" is parent-covered.
+    parent_covered: dict[str, str] = {}  # missing_id -> child_canonical that covers it
     for question in normalized.questions_array or []:
+        child_canonical = str(question.canonical_question_id or "").strip().lower()
+        if not child_canonical:
+            continue
+        for missing_id in missing_set:
+            if child_canonical.startswith(missing_id + ".") and missing_id not in parent_covered:
+                parent_covered[missing_id] = child_canonical
+
+    rescue_candidates = list(normalized.questions_array or [])
+    for question in rescue_candidates:
         canonical = str(question.canonical_question_id or "").strip().lower()
         if canonical:
             extracted_ids.append(canonical)
         if canonical in missing_set and canonical not in seen:
-            recovered.append(question)
+            rejection_reason = _rescue_exact_model_row_rejection_reason(
+                question,
+                rescue_candidates,
+                normalizer,
+            )
+            if rejection_reason:
+                rejected_recovered.append({
+                    "canonical_question_id": canonical,
+                    "reason": rejection_reason,
+                })
+                print(f"[RescueMissing][RejectedModelRow] {rejection_reason}")
+                continue
+            recovered.append(_strip_rescue_diagrams_if_needed(question))
             seen.add(canonical)
+
+    if str(os.getenv("PAPERLY_RESCUE_SYNTHESIZE_PARENT_COVER_STUBS", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        # Disabled by default: copied parent/child stubs make counts look fixed
+        # but poison question text for review and RAG. Exact recovered rows above
+        # remain enabled; non-exact parent coverage is reported only.
+        for missing_id in missing_set:
+            if missing_id in seen:
+                continue
+            child_canonical = parent_covered.get(missing_id)
+            if not child_canonical:
+                continue
+            for question in normalized.questions_array or []:
+                if str(question.canonical_question_id or "").strip().lower() == child_canonical:
+                    q_dict = question.model_dump(mode="json") if hasattr(question, "model_dump") else dict(question)
+                    stub = dict(q_dict)
+                    normalizer_local = QuestionNumberNormalizer()
+                    parent_parts = normalizer_local.extract_parts(missing_id)
+                    parent_label = normalizer_local.format_parts(parent_parts)
+                    stub["canonical_question_id"] = missing_id
+                    stub["question_id"] = parent_label
+                    stub["parent_canonical_id"] = normalizer_local.parent_from_parts(parent_parts)
+                    _child_label, child_remainder = normalizer_local.split_label_and_remainder(
+                        str(stub.get("question_latex") or "")
+                    )
+                    stub["question_latex"] = (
+                        f"{parent_label} {child_remainder}".strip() if child_remainder else parent_label
+                    )
+                    stub["needs_review"] = True
+                    warnings = stub.get("validation_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(
+                        f"Rescue mode: exact ID {missing_id!r} not found; "
+                        f"parent-covered by child {child_canonical!r}. Verify text."
+                    )
+                    stub["validation_warnings"] = warnings
+                    recovered.append(stub)
+                    seen.add(missing_id)
+                    print(
+                        f"[RescueMissing][ParentCover] {missing_id!r} not found exactly; "
+                        f"synthesized stub from child {child_canonical!r}."
+                    )
+                    break
+    elif parent_covered:
+        print(
+            "[RescueMissing][ParentCover] non_exact_parent_coverage_report_only="
+            f"{parent_covered}"
+        )
 
     recovered_payload = list(local_recovered_questions)
     recovered_payload.extend(q.model_dump(mode="json") for q in recovered)
     all_recovered_ids = sorted(local_seen | seen)
+    unrecovered_ids = [
+        missing_id for missing_id in missing_clean
+        if missing_id not in local_seen and missing_id not in seen
+    ]
+    split_hints = _build_rescue_split_hints(unrecovered_ids, rescue_candidates, normalizer)
+    selected_page_texts = [
+        page_texts[idx]
+        for idx in selected_page_indexes
+        if 0 <= idx < len(page_texts)
+    ]
+    split_review_rows = _build_rescue_split_review_rows(
+        unrecovered_ids,
+        rescue_candidates,
+        normalizer,
+        page_texts=selected_page_texts,
+    )
+    split_review_ids = {
+        str(row.get("canonical_question_id") or "").strip().lower()
+        for row in split_review_rows
+        if str(row.get("canonical_question_id") or "").strip()
+    }
+    if split_review_rows:
+        recovered_payload.extend(split_review_rows)
+        all_recovered_ids = sorted(set(all_recovered_ids) | split_review_ids)
+        unrecovered_ids = [
+            missing_id for missing_id in unrecovered_ids
+            if missing_id not in split_review_ids
+        ]
+
+    _log_extracted_rows(
+        "TargetedRescuePayload",
+        recovered_payload,
+        document_type="Question Paper",
+    )
 
     print(
         "[RescueMissing] "
         f"extracted={len(normalized.questions_array or [])} "
         f"extracted_ids={extracted_ids} "
-        f"recovered={sorted(seen)}"
+        f"recovered={sorted(seen)} split_review={sorted(split_review_ids)} "
+        f"rejected={rejected_recovered} split_hints={split_hints}"
     )
+
+    rejection_message = ""
+    if rejected_recovered:
+        rejected_ids = [
+            str(item.get("canonical_question_id") or "")
+            for item in rejected_recovered
+            if item.get("canonical_question_id")
+        ]
+        rejection_message = (
+            f" Rejected {len(rejected_recovered)} cloned/duplicate sibling row(s): "
+            f"{', '.join(rejected_ids)}."
+        )
+    split_hint_message = ""
+    if split_review_ids:
+        split_hint_message = (
+            " Created split-review row(s) from grouped source row(s): "
+            f"{', '.join(sorted(split_review_ids))}."
+        )
+    elif split_hints:
+        hint_ids = [
+            f"{hint.get('missing_id')} from {hint.get('source_id')}"
+            for hint in split_hints
+            if hint.get("missing_id") and hint.get("source_id")
+        ]
+        split_hint_message = (
+            " Exact rescue did not safely recover every ID; split grouped source row(s): "
+            f"{', '.join(hint_ids)}."
+        )
+
+    clean_recovered_count = len(local_recovered_questions) + len(recovered)
+    split_review_count = len(split_review_rows)
+    if split_review_count:
+        recovery_summary = (
+            f"Recovered {clean_recovered_count} exact row(s) and created "
+            f"{split_review_count} split-review row(s) from {len(selected_page_indexes)} targeted page(s)."
+        )
+    else:
+        recovery_summary = (
+            f"Recovered {clean_recovered_count} exact missing row(s) from "
+            f"{len(selected_page_indexes)} targeted page(s)."
+        )
 
     return {
         "metadata": normalized.metadata.model_dump(mode="json") if normalized.metadata else {},
@@ -5342,10 +7037,10 @@ async def rescue_missing_qp_questions(
             "pages_attempted": [idx + 1 for idx in selected_page_indexes],
             "extracted_ids": extracted_ids,
             "recovered_ids": all_recovered_ids,
-            "message": (
-                f"Recovered {len(recovered_payload)} exact missing row(s) from "
-                f"{len(selected_page_indexes)} targeted page(s)."
-            ),
+            "rejected_recovered": rejected_recovered,
+            "repair_hints": split_hints,
+            "split_review_ids": sorted(split_review_ids),
+            "message": recovery_summary + rejection_message + split_hint_message,
         },
     }
 

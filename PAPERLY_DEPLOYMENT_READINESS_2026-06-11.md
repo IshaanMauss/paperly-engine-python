@@ -166,3 +166,36 @@ This keeps the QA checks strict while making the reviewer workflow simpler:
 Read decision -> fix first action -> rescan -> open technical evidence only if
 exact IDs or repair buttons are needed.
 ```
+
+## Row Repair Proof - 2026-06-20
+
+The row-level repair button now has a concrete proof case from
+`igcse_0580_s24_43`, question `11.a`.
+
+Before repair, the row had the correct canonical ID but damaged extracted text:
+
+- raw native/Gemini-mixed text included `y = x - 7 x`
+- the circle-sector stem was polluted by barcode/page artifacts
+- the question had no clean self-contained diagram crop attached
+
+![Row repair before](docs/repair_proofs/row_repair_11a_before.png)
+
+After pressing `Repair Row`, the same canonical row was repaired into usable
+question text and received the connected PDF crop:
+
+- canonical ID stayed `11.a`
+- repaired text became self-contained:
+  `In the circle, centre O, the length of the minor arc PQ is 3/7 of the length
+  of the major arc PQ. Show that x = 108.`
+- the circle diagram/stem crop was attached to the row
+- this repair was row-scoped; it did not change paper numbering
+
+![Row repair after](docs/repair_proofs/row_repair_11a_after.png)
+
+Conclusion:
+
+```text
+Repair Row is useful for local row-level cleanup when numbering is already
+stable but one row has polluted text, missing parent context, or a missing
+connected diagram.
+```

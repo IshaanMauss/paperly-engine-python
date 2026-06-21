@@ -1,8 +1,36 @@
 .env
+.env.*
+!.env.example
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.log
 .extraction_cache/
 PAPERLYWORKSPACE.code-workspace
+
+# Local/generated extraction artifacts
+tmp/
+output/
+rollback_snapshots/
+sample_*.json
+*.bson
+*.metadata.json
+*.zip
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.docx
+
+# Local reports and handover exports
+paperly_mongo_handover_dump_*/
+tools/create_*_pdf.py
+tools/create_*_doc.py
+tools/create_paperly_meeting_report.py
+
+# Test/cache noise
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

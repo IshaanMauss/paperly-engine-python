@@ -9,6 +9,7 @@ numbering authority for Question Paper rows after initial extraction.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections import defaultdict
 from typing import Any
@@ -415,6 +416,106 @@ def _suppress_confirmed_warnings(
     return out
 
 
+def _repair_grouped_parent_into_children(
+    questions_raw: list[dict],
+    ms_tree: _MSTree,
+    normalizer: QuestionNumberNormalizer,
+) -> list[dict]:
+    """
+    Split QP rows whose canonical ID is a NON-leaf MS parent into their MS-expected
+    children when the children are all missing from the QP output.
+
+    Example: QP has row "4(f)" but MS expects "4.f.i", "4.f.ii", "4.f.iii".
+    If all three children are absent from QP, split the grouped "4(f)" row into
+    three rows with needs_review=True so the text is assigned and humans can verify.
+
+    Only activates when:
+      1. The QP row's canonical ID is in ms_tree.implied_ids (a non-leaf parent).
+      2. ALL expected MS children of that parent are absent from the current QP.
+      3. The parent has ≥ 2 expected MS children (avoids false triggers on single-child parents).
+    """
+    original_canonicals = {
+        _canonical(raw, normalizer)
+        for raw in questions_raw
+        if isinstance(raw, dict)
+    }
+    original_canonicals.discard("")
+
+    # Find all leaf (exact) children grouped under each implied parent
+    children_by_parent: dict[str, list[list[str]]] = defaultdict(list)
+    for parts in ms_tree.exact_parts:
+        for depth in range(1, len(parts)):
+            parent_canonical = normalizer.canonical_from_parts(parts[:depth])
+            if parent_canonical and parent_canonical in ms_tree.implied_ids:
+                # Only record leaf-level children (exact MS IDs, not their sub-parents)
+                child_canonical = normalizer.canonical_from_parts(parts)
+                if child_canonical in ms_tree.exact_ids:
+                    if parts not in children_by_parent[parent_canonical]:
+                        children_by_parent[parent_canonical].append(parts)
+
+    output: list[dict] = []
+    for raw in questions_raw:
+        if not isinstance(raw, dict):
+            output.append(raw)
+            continue
+
+        canonical = _canonical(raw, normalizer)
+        if not canonical or canonical not in ms_tree.implied_ids:
+            output.append(raw)
+            continue
+
+        children = children_by_parent.get(canonical, [])
+        # Only split when at least 2 children are expected AND all are currently missing.
+        if len(children) < 2:
+            output.append(raw)
+            continue
+        children_missing = [
+            child_parts
+            for child_parts in children
+            if normalizer.canonical_from_parts(child_parts) not in original_canonicals
+        ]
+        if len(children_missing) != len(children):
+            # Some children are already present — don't split, let the existing rows win.
+            output.append(raw)
+            continue
+
+        # Split the grouped parent row into one child row per expected child.
+        parent_label, parent_remainder = normalizer.split_label_and_remainder(
+            str(raw.get("question_latex") or "")
+        )
+        parent_body = parent_remainder.strip() or str(raw.get("question_latex") or "").strip()
+
+        logger.info(
+            "[MSReconciler][GroupedParentSplit] Splitting grouped QP row %r into %d MS-expected children.",
+            canonical,
+            len(children),
+        )
+        print(
+            f"[MSReconciler][GroupedParentSplit] {canonical!r} → "
+            f"{[normalizer.canonical_from_parts(c) for c in children]}"
+        )
+
+        for child_parts in children:
+            child_canonical = normalizer.canonical_from_parts(child_parts)
+            child_label = normalizer.format_parts(child_parts)
+            child = dict(raw)
+            child["canonical_question_id"] = child_canonical
+            child["question_id"] = child_label
+            child["parent_canonical_id"] = normalizer.parent_from_parts(child_parts)
+            child["question_latex"] = f"{child_label} {parent_body}".strip() if parent_body else child_label
+            child["needs_review"] = True
+            warnings = child.get("validation_warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            warnings.append(
+                f"MS reconciler split grouped QP row {canonical!r} into child {child_canonical!r}; verify text."
+            )
+            child["validation_warnings"] = warnings
+            output.append(child)
+
+    return output
+
+
 def reconcile_qp_against_ms(
     questions_raw: list[dict],
     expected_canonical_ids: list[str],
@@ -435,8 +536,11 @@ def reconcile_qp_against_ms(
     )
     questions_raw = _repair_root_only_rows(questions_raw, ms_tree, question_normalizer)
     questions_raw = _repair_missing_letter_parent(questions_raw, ms_tree, question_normalizer)
+    if str(os.getenv("PAPERLY_QP_RECONCILE_SPLIT_GROUPED_PARENT", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        questions_raw = _repair_grouped_parent_into_children(questions_raw, ms_tree, question_normalizer)
     questions_raw = _suppress_confirmed_warnings(questions_raw, ms_tree, question_normalizer)
     return questions_raw
-
 
 __all__ = ["reconcile_qp_against_ms"]
